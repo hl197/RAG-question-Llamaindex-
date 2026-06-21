@@ -1,8 +1,15 @@
 """
 全局配置文件
+
+API Key 加载优先级：
+  1. 环境变量 DEEPSEEK_API_KEY（最高优先级）
+  2. .env 文件（开发环境）
+  3. config/keys.enc 加密文件（生产环境/仓库提交）
+     - 需要环境变量 KEY_PASSPHRASE 提供解密口令
 """
 
 import os
+import base64
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -10,8 +17,40 @@ from dotenv import load_dotenv
 _env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=str(_env_path))
 
+
+def _try_decrypt_key() -> str:
+    """尝试从 config/keys.enc 解密 API Key"""
+    enc_file = Path(__file__).parent / "config" / "keys.enc"
+    passphrase = os.getenv("KEY_PASSPHRASE", "")
+
+    if not enc_file.exists() or not passphrase:
+        return ""
+
+    try:
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+        encrypted_data = enc_file.read_bytes()
+        salt = encrypted_data[:16]
+        ciphertext = encrypted_data[16:]
+
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=600_000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+        return Fernet(key).decrypt(ciphertext).decode("utf-8")
+    except Exception:
+        return ""
+
+
 # ===== DeepSeek API =====
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+_try_env = os.getenv("DEEPSEEK_API_KEY") or ""
+_try_enc = _try_decrypt_key()
+DEEPSEEK_API_KEY = _try_env or _try_enc or ""
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 # ===== 模型配置 =====
