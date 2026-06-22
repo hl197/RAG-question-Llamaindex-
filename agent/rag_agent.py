@@ -211,6 +211,69 @@ class RAGAgent:
 
         return reply
 
+    def chat_stream(self, message: str, session_id: Optional[str] = None) -> List[str]:
+        """
+        流式对话接口。收集所有流式 chunk 后返回列表。
+        （不直接 yield 以避免生成器重入冲突）
+
+        Args:
+            message: 用户消息
+            session_id: 会话 ID（None 自动创建）
+
+        Returns:
+            List[str]: 每个元素为累积回复文本，最后一个是完整回复
+        """
+        # 会话管理（同 chat()）
+        if session_id is None:
+            session_id = self.memory.create_session()
+        self.current_session_id = session_id
+
+        if not self.memory.session_exists(session_id):
+            self.memory.create_session()
+            self.memory.rename_session(session_id, "")
+            self._init_session_memory(session_id)
+
+        if self.memory.get_message_count(session_id) == 0:
+            self._init_session_memory(session_id)
+        else:
+            if self.memory.needs_compression(session_id):
+                self._compress_memory(session_id)
+            self._load_session_to_agent(session_id)
+
+        # 保存用户消息
+        self.memory.save_message(session_id, "user", message)
+
+        # Agent 流式处理（带自动重试）
+        import traceback
+
+        chunks: List[str] = []
+        for attempt in range(2):
+            try:
+                stream_response = self._agent.stream_chat(message)
+                for chat_resp in stream_response.chat_stream:
+                    if chat_resp and chat_resp.response:
+                        chunks.append(str(chat_resp.response))
+                break  # 成功，跳出重试循环
+            except Exception as e:
+                error_detail = traceback.format_exc()
+                print(f"\n{'='*50}")
+                print(f"❌ Agent 流式调用出错 (第{attempt+1}次)")
+                print(f"   异常类型: {type(e).__name__}")
+                print(f"   异常信息: {e}")
+                print(f"{'='*50}\n")
+
+                if attempt == 0:
+                    print("🔄 重置记忆并重试...")
+                    self._agent.reset()
+                    self._init_session_memory(session_id)
+                else:
+                    chunks = [f"抱歉，处理时出错: {type(e).__name__}: {e}"]
+
+        # 保存助手回复（取最后一个 chunk 作为完整回复）
+        full_response = chunks[-1] if chunks else ""
+        self.memory.save_message(session_id, "assistant", full_response)
+        return chunks
+
     def _init_session_memory(self, session_id: str):
         """初始化新会话的记忆"""
         # 插入一条系统消息告知 agent 其角色
@@ -274,6 +337,15 @@ class RAGAgent:
         self.current_session_id = session_id
         self._load_session_to_agent(session_id)
         return True
+
+    def get_session_history(self, session_id: str) -> List[Dict]:
+        """获取指定会话的历史消息列表，用于前端显示"""
+        messages = self.memory.load_history(session_id)
+        history = []
+        for msg in messages:
+            role = "user" if msg.role == MessageRole.USER else "assistant"
+            history.append({"role": role, "content": msg.content})
+        return history
 
     def get_sessions(self) -> List[Dict]:
         """获取会话列表"""

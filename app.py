@@ -57,6 +57,34 @@ def chat_fn(message: str, history: List) -> str:
     return reply
 
 
+def load_session_history(session_label) -> List:
+    """解析 session_label 并加载对应会话的历史消息"""
+    if not session_label or session_label == "（无会话）":
+        return []
+    import re
+    match = re.search(r'\(([a-f0-9]+)\)', session_label)
+    if not match:
+        return []
+    session_id = match.group(1)
+    agent = get_agent()
+    return agent.get_session_history(session_id)
+
+
+def initial_load():
+    """页面加载时刷新数据并加载首个会话的历史到聊天框"""
+    file_list_val = refresh_file_list()
+    stats_val = refresh_stats()
+    session_update = refresh_sessions()  # gr.update
+    # 从 gr.update 提取当前选中的会话 label
+    current_label = getattr(session_update, 'value', None)
+    # 同步切换 agent 到对应的会话，并加载历史
+    if current_label and current_label != "（无会话）":
+        _, history = switch_session(current_label)
+    else:
+        history = []
+    return file_list_val, stats_val, session_update, history
+
+
 def upload_file(file_obj) -> str:
     """
     上传文件处理。
@@ -134,27 +162,28 @@ def new_session() -> str:
     return f"已创建新会话: {session_id}"
 
 
-def switch_session(session_label) -> str:
-    """切换会话"""
+def switch_session(session_label) -> tuple:
+    """切换会话，返回 (提示消息, 历史消息列表)"""
     # 防 Gradio 内部事件传递列表（demo.load 刷新 dropdown 时可能触发）
     if isinstance(session_label, list):
         session_label = session_label[-1] if session_label else None
     if not session_label or session_label == "（无会话）":
-        return "请选择有效的会话"
+        return "请选择有效的会话", []
 
     # 从标签提取 session_id: "会话名 (abc123)"
     import re
     match = re.search(r'\(([a-f0-9]+)\)', session_label)
     if not match:
-        return "无法解析会话 ID"
+        return "无法解析会话 ID", []
 
     session_id = match.group(1)
     agent = get_agent()
     if agent.switch_session(session_id):
-        # 清空聊天界面（切换会话后历史刷新靠前端 reload）
-        return f"已切换到会话: {session_id}"
+        # 加载该会话的历史消息
+        history = agent.get_session_history(session_id)
+        return f"已切换到会话: {session_id}", history
     else:
-        return "切换失败，会话不存在"
+        return "切换失败，会话不存在", []
 
 
 def clear_knowledge() -> str:
@@ -310,14 +339,25 @@ def build_ui():
 
         # ── 事件绑定 ──────────────────────────────
 
-        # 对话处理
+        # 对话处理（流式）
         def respond(message, history):
             if not message or not message.strip():
-                return "", history
-            reply = chat_fn(message.strip(), history)
+                yield "", history
+                return
+            agent = get_agent()
+            session_id = agent.get_current_session_id()
+            if session_id is None:
+                session_id = agent.new_session()
+
             history.append({"role": "user", "content": message.strip()})
-            history.append({"role": "assistant", "content": reply})
-            return "", history
+
+            full_response = ""
+            for partial in agent.chat_stream(message.strip(), session_id):
+                full_response = partial
+                new_history = history + [{"role": "assistant", "content": full_response}]
+                yield "", new_history
+
+            yield "", history + [{"role": "assistant", "content": full_response}]
 
         msg_input.submit(respond, [msg_input, chatbot], [msg_input, chatbot])
         send_btn.click(respond, [msg_input, chatbot], [msg_input, chatbot])
@@ -359,35 +399,42 @@ def build_ui():
             outputs=[session_status, file_list, stats_box],
         )
 
-        # 刷新会话
+        # 刷新会话（加载首个会话历史到聊天框）
+        def handle_refresh_sessions():
+            session_update = refresh_sessions()
+            current_label = getattr(session_update, 'value', None)
+            if current_label and current_label != "（无会话）":
+                _, history = switch_session(current_label)
+            else:
+                history = []
+            return session_update, history
+
         refresh_session_btn.click(
-            fn=refresh_sessions,
-            outputs=[session_dropdown],
+            fn=handle_refresh_sessions,
+            outputs=[session_dropdown, chatbot],
         )
 
-        # 新会话
+        # 新会话（清空聊天框）
         new_session_btn.click(
-            fn=lambda: (new_session(), refresh_sessions()),
-            outputs=[session_status, session_dropdown],
+            fn=lambda: (new_session(), refresh_sessions(), []),
+            outputs=[session_status, session_dropdown, chatbot],
         )
 
-        # 切换会话
+        # 切换会话（加载历史到聊天框）
         session_dropdown.change(
             fn=switch_session,
             inputs=[session_dropdown],
-            outputs=[session_status],
+            outputs=[session_status, chatbot],
         )
 
-        # 页面加载时刷新
+        # 页面加载时刷新（加载会话历史到聊天框）
         demo.load(
-            fn=lambda: (
-                refresh_file_list(),
-                refresh_stats(),
-                refresh_sessions(),
-            ),
-            outputs=[file_list, stats_box, session_dropdown],
+            fn=initial_load,
+            outputs=[file_list, stats_box, session_dropdown, chatbot],
         )
 
+    # 启用队列以支持流式输出
+    demo.queue(default_concurrency_limit=5)
     return demo
 
 
