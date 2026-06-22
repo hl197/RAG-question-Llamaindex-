@@ -107,6 +107,13 @@ def _load_file_registry() -> List[str]:
     return []
 
 
+def _get_collection():
+    """获取 ChromaDB 集合对象"""
+    if _chroma_client is None:
+        raise RuntimeError("ChromaDB 未初始化，请先调用 init_chroma()")
+    return _chroma_client.get_collection("knowledge_base")
+
+
 # ── 索引构建 ──────────────────────────────────────
 def build_or_update_index(
     documents: List[Document],
@@ -197,6 +204,36 @@ def get_query_engine(
 
 
 # ── 工具函数 ──────────────────────────────────────
+def remove_file(filename: str) -> bool:
+    """
+    从 ChromaDB 中删除指定文件名的所有文档片段。
+
+    Args:
+        filename: 文件名（如 "简历.pdf"）
+
+    Returns:
+        bool: 是否成功删除
+    """
+    global _loaded_files
+
+    try:
+        collection = _get_collection()
+        # 按文件名元数据过滤删除
+        collection.delete(where={"filename": filename})
+
+        # 更新 file_registry
+        _loaded_files = _load_file_registry()
+        if filename in _loaded_files:
+            _loaded_files.remove(filename)
+            _save_file_registry()
+
+        print(f"✅ 已从知识库中删除: {filename}")
+        return True
+    except Exception as e:
+        print(f"❌ 删除文件失败: {e}")
+        return False
+
+
 def list_uploaded_files() -> List[str]:
     """返回已上传的文件名列表"""
     global _loaded_files
@@ -228,11 +265,8 @@ def clear_knowledge_base():
 
 def get_collection_stats() -> Dict:
     """返回集合统计信息"""
-    if _chroma_client is None:
-        return {"status": "not_initialized"}
-
     try:
-        collection = _chroma_client.get_collection("knowledge_base")
+        collection = _get_collection()
         return {
             "total_vectors": collection.count(),
             "files_count": len(list_uploaded_files()),

@@ -198,9 +198,9 @@ class RAGAgent:
                 print(f"{'='*50}\n")
 
                 if attempt == 0:
-                    # 第一次失败，重建 Agent 后重试
-                    print("🔄 重建 Agent 并重试...")
-                    self._agent = self._create_agent()
+                    # 不清除工具，只重置 memory 和 buffer
+                    print("🔄 重置记忆并重试...")
+                    self._agent.reset()
                     self._init_session_memory(session_id)
                 else:
                     # 第二次仍失败，给用户显示详细错误
@@ -388,6 +388,10 @@ class RAGAgent:
     def get_knowledge_stats(self) -> Dict:
         """获取知识库统计"""
         return indexer.get_collection_stats()
+
+    def delete_file(self, filename: str) -> bool:
+        """从知识库中删除指定文件"""
+        return indexer.remove_file(filename)
 
     def clear_knowledge(self):
         """清空知识库（谨慎使用）"""

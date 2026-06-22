@@ -6,6 +6,8 @@ DeepSeek LLM 封装 —— 兼容 LlamaIndex LLM 接口。
 
 import asyncio
 import httpx
+import random
+import time
 from typing import Any, Optional, Sequence, List, Generator
 
 from llama_index.core.llms import (
@@ -78,21 +80,45 @@ class DeepSeekLLM(LLM):
             is_chat_model=True,
         )
 
+    # ── 指数退避重试 ─────────────────────────────
+
+    def _call_with_retry(self, api_call_func, max_retries=3):
+        """带指数退避的 API 调用"""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return api_call_func()
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                # 只在 429/503/服务端错误时重试
+                if any(code in error_str for code in ['429', '503', 'rate', 'limit', 'too many', 'server error', 'governor']):
+                    if attempt < max_retries - 1:
+                        sleep_time = (2 ** attempt) + random.uniform(0, 1)
+                        print(f"⚠️ API 限速，{sleep_time:.1f}s 后重试 (第{attempt+1}次)...")
+                        time.sleep(sleep_time)
+                        continue
+                    raise  # 非限速错误直接抛出
+                raise
+        raise last_error  # 重试用完仍失败
+
     # ── 核心接口 ──────────────────────────────────
 
     def chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
-        """对话生成"""
+        """对话生成（带指数退避重试）"""
         openai_messages = []
         for msg in messages:
             role = msg.role.value if hasattr(msg.role, "value") else str(msg.role)
             content = msg.content or ""
             openai_messages.append({"role": role, "content": content})
 
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=openai_messages,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+        response = self._call_with_retry(
+            lambda: self._client.chat.completions.create(
+                model=self.model,
+                messages=openai_messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
         )
 
         reply = response.choices[0].message.content or ""
@@ -102,12 +128,14 @@ class DeepSeekLLM(LLM):
         )
 
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
-        """文本补全（包装为单轮对话）"""
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+        """文本补全（包装为单轮对话，带指数退避重试）"""
+        response = self._call_with_retry(
+            lambda: self._client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
         )
 
         text = response.choices[0].message.content or ""
@@ -118,7 +146,7 @@ class DeepSeekLLM(LLM):
     def stream_chat(
         self, messages: Sequence[ChatMessage], **kwargs: Any
     ) -> ChatResponseGen:
-        """流式对话生成"""
+        """流式对话生成（流式创建带指数退避重试）"""
         openai_messages = [
             {
                 "role": msg.role.value if hasattr(msg.role, "value") else str(msg.role),
@@ -127,24 +155,28 @@ class DeepSeekLLM(LLM):
             for msg in messages
         ]
 
-        stream = self._client.chat.completions.create(
-            model=self.model,
-            messages=openai_messages,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            stream=True,
+        stream = self._call_with_retry(
+            lambda: self._client.chat.completions.create(
+                model=self.model,
+                messages=openai_messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream=True,
+            )
         )
 
         return self._stream_chat_to_gen(stream)
 
     def stream_complete(self, prompt: str, **kwargs: Any) -> CompletionResponseGen:
-        """流式文本补全"""
-        stream = self._client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            stream=True,
+        """流式文本补全（流式创建带指数退避重试）"""
+        stream = self._call_with_retry(
+            lambda: self._client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream=True,
+            )
         )
 
         return self._stream_complete_to_gen(stream)
