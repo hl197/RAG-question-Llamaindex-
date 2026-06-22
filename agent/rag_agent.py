@@ -244,66 +244,8 @@ class RAGAgent:
             self._agent.memory.put(msg)
 
     def _compress_memory(self, session_id: str):
-        """压缩会话历史：将旧消息摘要化"""
-        history = self.memory.load_history(session_id)
-        if len(history) <= 4:  # 消息太少，不压缩
-            return
-
-        # 取前面的消息（保留最近 4 条）
-        to_compress = history[:-4]
-        recent = history[-4:]
-
-        # 用 LLM 生成摘要
-        text_to_summarize = "\n".join(
-            f"{'用户' if m.role == MessageRole.USER else '助手'}: {m.content}"
-            for m in to_compress
-        )
-
-        summary_prompt = (
-            f"请对以下对话内容进行简洁的中文摘要，保留关键信息（用户问题、涉及的主题、重要结论）：\n\n"
-            f"{text_to_summarize}\n\n摘要："
-        )
-
-        try:
-            response = self.llm.complete(summary_prompt)
-            summary = str(response).strip()
-
-            # 保存摘要
-            self.memory.save_summary(
-                session_id=session_id,
-                summary_text=summary,
-                message_count=len(to_compress),
-                token_count=self.memory.estimate_tokens(session_id),
-            )
-
-            # 重建 SQLite 中的历史为摘要 + 最近消息
-            conn = self.memory._get_conn()
-            try:
-                # 删除旧消息
-                conn.execute(
-                    "DELETE FROM conversations WHERE session_id = ?",
-                    (session_id,),
-                )
-                # 插入摘要消息
-                conn.execute(
-                    "INSERT INTO conversations (session_id, role, content, session_name) "
-                    "VALUES (?, 'system', ?, '')",
-                    (session_id, f"[历史摘要] {summary}"),
-                )
-                # 重新插入最近消息
-                for msg in recent:
-                    role = "user" if msg.role == MessageRole.USER else "assistant"
-                    conn.execute(
-                        "INSERT INTO conversations (session_id, role, content) "
-                        "VALUES (?, ?, ?)",
-                        (session_id, role, msg.content),
-                    )
-                conn.commit()
-            finally:
-                conn.close()
-
-        except Exception as e:
-            print(f"记忆压缩失败: {e}")
+        """压缩会话历史：将旧消息摘要化（委托给 memory.py 的 compress 方法）"""
+        self.memory.compress(session_id, self.llm)
 
     # ── 会话管理 ──────────────────────────────────
 
