@@ -165,6 +165,18 @@ def clear_knowledge() -> str:
     return "🗑️ 知识库已清空"
 
 
+def delete_file_and_refresh(filename: str):
+    """删除指定文件并刷新界面"""
+    if not filename or not filename.strip():
+        return "请输入要删除的文件名", refresh_file_list(), refresh_stats()
+    agent = get_agent()
+    ok = agent.delete_file(filename.strip())
+    if ok:
+        return f"✅ 已删除: {filename.strip()}", refresh_file_list(), refresh_stats()
+    else:
+        return f"❌ 删除失败: {filename.strip()}（文件不存在或出错）", refresh_file_list(), refresh_stats()
+
+
 # ── UI 构建 ──────────────────────────────────────
 
 CSS = """
@@ -248,6 +260,17 @@ def build_ui():
                         interactive=False,
                     )
 
+                # 🗑️ 删除文件
+                with gr.Group(elem_classes="sidebar-section"):
+                    gr.Markdown("### 🗑️ 删除文件")
+                    with gr.Row():
+                        delete_filename = gr.Textbox(
+                            label="输入要删除的文件名",
+                            placeholder="如：简历.pdf",
+                            scale=3,
+                        )
+                        delete_btn = gr.Button("删除", variant="stop", scale=1, min_width=60)
+
                 # 📋 会话管理
                 with gr.Group(elem_classes="sidebar-section"):
                     gr.Markdown("### 💬 会话")
@@ -326,6 +349,13 @@ def build_ui():
                 refresh_file_list(),
                 refresh_stats(),
             ),
+            outputs=[session_status, file_list, stats_box],
+        )
+
+        # 删除文件
+        delete_btn.click(
+            fn=delete_file_and_refresh,
+            inputs=[delete_filename],
             outputs=[session_status, file_list, stats_box],
         )
 
