@@ -5,11 +5,13 @@ RAG Agent 封装
 """
 
 import os
+import re
 from typing import List, Optional, Dict
 
 from llama_index.core import Settings, Document
 from llama_index.core.agent import AgentRunner
 from llama_index.core.agent.react import ReActAgentWorker
+from llama_index.core.agent.react.formatter import ReActChatFormatter
 from llama_index.core.tools import QueryEngineTool, FunctionTool
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
@@ -19,6 +21,83 @@ from agent.llm_adapter import create_llm
 import config
 from knowledge import loader, indexer
 from agent.memory import PersistentChatMemory
+
+
+# 针对 DeepSeek 优化的 ReAct 系统提示模板
+_DEEPSEEK_REACT_SYSTEM_HEADER = """\
+You are a helpful AI assistant designed to answer questions using the tools available to you.
+
+## Tools
+
+You have access to the following tools:
+{tool_desc}
+
+## Output Format — STRICTLY REQUIRED
+
+You MUST follow the format below. THIS IS MANDATORY.
+
+### When you need to use a tool — start with "Thought:":
+
+Thought: <your reasoning in the user's language>
+Action: <tool name — one of {tool_names}>
+Action Input: <JSON kwargs, e.g. {{"input": "query text"}}>
+
+### When you can answer directly — start with "Thought:":
+
+Thought: <your reasoning in the user's language>
+Answer: <your final answer>
+
+### CRITICAL RULES (violation will break the system):
+1. Your response MUST start with "Thought:" as the FIRST word.
+2. After you get an "Observation:" back from a tool, continue with another "Thought:" step.
+3. When you have enough information, end with:
+   Thought: ...
+   Answer: <final answer>
+
+## Current Conversation
+
+Below is the current conversation consisting of interleaving human and assistant messages.
+"""
+
+
+# 后置过滤：从 Agent 回复中剥离 ReAct 追踪文本，只保留最终答案
+def _strip_react_trace(text: str) -> str:
+    # 从 Agent 原始输出中提取最终答案，去掉 ReAct 中间步骤
+    # 1) 如果包含 "Answer:"，取最后一个 "Answer:" 之后的内容（应对多步推理）
+    if "Answer:" in text:
+        return text.rsplit("Answer:", 1)[-1].strip()
+    # 2) 如果包含 "Action:"，说明工具调用步骤泄露了，尝试取 "Action:" 之前的内容
+    if "Action:" in text:
+        parts = text.split("Action:", 1)
+        before_action = parts[0].strip()
+        # 如果 Action 前面是 Thought，去掉 Thought 前缀
+        before_action = re.sub(r'^Thought:\s*', '', before_action).strip()
+        return before_action if before_action else text
+    # 3) 去掉孤立 "Thought:" 前缀
+    text = re.sub(r'^Thought:\s*', '', text).strip()
+    return text
+
+
+class FixedReActAgentWorker(ReActAgentWorker):
+    """修正版 — DeepSeek 输出不总是以 "Thought:" 开头，原版 _infer_stream_chunk_is_final
+    会误判为首个 chunk 就是最终答案，导致 ReAct 循环被提前截断。
+
+    修复：只有确认包含 "Answer:" 时才视为最终 chunk，否则继续收集。
+    """
+
+    def _infer_stream_chunk_is_final(
+        self, chunk, missed_chunks_storage: list
+    ) -> bool:
+        full_text = (chunk.message.content or "").strip()
+        if not full_text:
+            return False
+        if len(full_text) < 7:
+            missed_chunks_storage.append(chunk)
+            return False
+        if "Answer:" in full_text:
+            missed_chunks_storage.clear()
+            return True
+        return False
 
 
 class RAGAgent:
@@ -50,6 +129,9 @@ class RAGAgent:
         # ── 记忆 ──
         self.memory = PersistentChatMemory()
         self.current_session_id: Optional[str] = None
+
+        # ── Token 用量跟踪 ──
+        self._session_token_usage: Dict[str, Dict[str, int]] = {}
 
         # ── 启动时检测 LLM 连接 ──
         self._warmup_llm()
@@ -126,16 +208,20 @@ class RAGAgent:
 
     def _create_agent(self) -> AgentRunner:
         """创建 AgentRunner 实例"""
-        agent_worker = ReActAgentWorker.from_tools(
+        custom_formatter = ReActChatFormatter(
+            system_header=_DEEPSEEK_REACT_SYSTEM_HEADER,
+        )
+        agent_worker = FixedReActAgentWorker.from_tools(
             tools=self._tools,
             llm=self.llm,
             verbose=True,
             max_iterations=15,
+            react_chat_formatter=custom_formatter,
         )
         agent = AgentRunner(
             agent_worker=agent_worker,
             memory=ChatMemoryBuffer.from_defaults(
-                token_limit=config.MAX_HISTORY_TOKENS * 2,  # 给 agent 内部 buffer 更大的空间
+                token_limit=config.MAX_HISTORY_TOKENS * 2,
             ),
         )
         return agent
@@ -178,6 +264,9 @@ class RAGAgent:
         # 保存用户消息
         self.memory.save_message(session_id, "user", message)
 
+        # 记录 Agent 处理前的 token 用量
+        usage_before = self.llm.get_token_usage()
+
         # Agent 处理（带自动重试）
         import traceback
 
@@ -206,22 +295,23 @@ class RAGAgent:
                     # 第二次仍失败，给用户显示详细错误
                     reply = f"抱歉，处理时出错: {type(e).__name__}: {e}"
 
-        # 保存助手回复
+        # 跟踪 token 用量
+        usage_after = self.llm.get_token_usage()
+        self._track_session_usage(session_id, usage_before, usage_after)
+
+        # 保存助手回复（过滤掉可能泄露的 ReAct 追踪文本）
+        reply = _strip_react_trace(reply)
         self.memory.save_message(session_id, "assistant", reply)
 
         return reply
 
-    def chat_stream(self, message: str, session_id: Optional[str] = None) -> List[str]:
+    def chat_stream(self, message: str, session_id: Optional[str] = None):
         """
-        流式对话接口。收集所有流式 chunk 后返回列表。
-        （不直接 yield 以避免生成器重入冲突）
+        流式对话生成器。逐块 yield 累积回复文本，前端可实时渲染。
 
-        Args:
-            message: 用户消息
-            session_id: 会话 ID（None 自动创建）
-
-        Returns:
-            List[str]: 每个元素为累积回复文本，最后一个是完整回复
+        应对两种场景：
+        1) LLM 输出了 "Answer:" 标记 → response_gen 自然流式，逐 chunk yield
+        2) 未输出 "Answer:"（伪流式） → 收集后手动拆分为渐进块再 yield
         """
         # 会话管理（同 chat()）
         if session_id is None:
@@ -243,17 +333,65 @@ class RAGAgent:
         # 保存用户消息
         self.memory.save_message(session_id, "user", message)
 
+        # 记录 Agent 处理前的 token 用量
+        usage_before = self.llm.get_token_usage()
+
         # Agent 流式处理（带自动重试）
         import traceback
 
-        chunks: List[str] = []
         for attempt in range(2):
             try:
                 stream_response = self._agent.stream_chat(message)
-                for chat_resp in stream_response.chat_stream:
-                    if chat_resp and chat_resp.response:
-                        chunks.append(str(chat_resp.response))
+                gen = stream_response.response_gen
+
+                # ── peek 前 2 个 chunk，判断是真流式还是伪流式 ──
+                first: str = ""
+                second: str = ""
+                try:
+                    d = next(gen)
+                    if d:
+                        first = d
+                except StopIteration:
+                    pass
+
+                try:
+                    d = next(gen)
+                    if d:
+                        second = d
+                except StopIteration:
+                    pass
+
+                # 拼起来
+                full_response = first + second
+
+                # 收集到的实际 chunk 数
+                real_chunks = (1 if first else 0) + (1 if second else 0)
+
+                if real_chunks <= 2 and full_response and len(full_response) > 30:
+                    # ── 伪流式: response_gen 只吐了 1-2 个 chunk（一次全量）──
+                    # 手动拆分为渐进块并逐步 yield
+                    step = max(3, len(full_response) // 40)
+                    text_so_far = ""
+                    for i in range(0, len(full_response), step):
+                        text_so_far = full_response[:i + step]
+                        yield text_so_far
+                    full_response = text_so_far
+                else:
+                    # ── 真流式: 继续消费剩余 chunk，逐步 yield ──
+                    # 先把已取到的 yield 出去（如果只有 first，那 second 是空的）
+                    if first:
+                        yield first
+                    if second:
+                        full_response = second
+                        yield second
+                    # 继续消费剩余的 gen
+                    for delta in gen:
+                        if delta:
+                            full_response += delta
+                            yield full_response
+
                 break  # 成功，跳出重试循环
+
             except Exception as e:
                 error_detail = traceback.format_exc()
                 print(f"\n{'='*50}")
@@ -267,12 +405,16 @@ class RAGAgent:
                     self._agent.reset()
                     self._init_session_memory(session_id)
                 else:
-                    chunks = [f"抱歉，处理时出错: {type(e).__name__}: {e}"]
+                    yield f"抱歉，处理时出错: {type(e).__name__}: {e}"
+                    full_response = ""
 
-        # 保存助手回复（取最后一个 chunk 作为完整回复）
-        full_response = chunks[-1] if chunks else ""
-        self.memory.save_message(session_id, "assistant", full_response)
-        return chunks
+        # 跟踪 token 用量
+        usage_after = self.llm.get_token_usage()
+        self._track_session_usage(session_id, usage_before, usage_after)
+
+        # 保存助手回复（后置清理 ReAct 追踪文本）
+        cleaned = _strip_react_trace(full_response)
+        self.memory.save_message(session_id, "assistant", cleaned or full_response)
 
     def _init_session_memory(self, session_id: str):
         """初始化新会话的记忆"""
@@ -309,6 +451,29 @@ class RAGAgent:
     def _compress_memory(self, session_id: str):
         """压缩会话历史：将旧消息摘要化（委托给 memory.py 的 compress 方法）"""
         self.memory.compress(session_id, self.llm)
+
+    # ── Token 用量跟踪 ──────────────────────────────
+
+    def _track_session_usage(self, session_id: str, before: dict, after: dict):
+        """对比 before/after 的累积 token 数，差值归集到当前会话"""
+        if session_id not in self._session_token_usage:
+            self._session_token_usage[session_id] = {"prompt_tokens": 0, "completion_tokens": 0}
+        self._session_token_usage[session_id]["prompt_tokens"] += after["prompt_tokens"] - before["prompt_tokens"]
+        self._session_token_usage[session_id]["completion_tokens"] += after["completion_tokens"] - before["completion_tokens"]
+
+    def get_session_token_usage(self, session_id: str) -> Dict[str, int]:
+        """获取指定会话的 token 消耗统计"""
+        return self._session_token_usage.get(session_id, {"prompt_tokens": 0, "completion_tokens": 0})
+
+    def get_total_token_usage(self) -> Dict[str, int]:
+        """获取所有会话的累积 token 消耗"""
+        total_prompt = sum(s["prompt_tokens"] for s in self._session_token_usage.values())
+        total_completion = sum(s["completion_tokens"] for s in self._session_token_usage.values())
+        return {
+            "prompt_tokens": total_prompt,
+            "completion_tokens": total_completion,
+            "total_tokens": total_prompt + total_completion,
+        }
 
     # ── 会话管理 ──────────────────────────────────
 
@@ -354,6 +519,7 @@ class RAGAgent:
     def delete_session(self, session_id: str):
         """删除会话"""
         self.memory.delete_session(session_id)
+        self._session_token_usage.pop(session_id, None)
         if self.current_session_id == session_id:
             self.current_session_id = None
 

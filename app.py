@@ -134,8 +134,10 @@ def refresh_stats() -> str:
     """刷新知识库统计"""
     agent = get_agent()
     stats = agent.get_knowledge_stats()
+
     if stats.get("status") == "not_initialized" or stats.get("total_vectors", 0) == 0:
         return "知识库为空"
+
     return (
         f"📄 文件: {stats.get('files_count', 0)} 个\n"
         f"🧩 片段: {stats.get('total_vectors', 0)} 个"
@@ -351,11 +353,13 @@ def build_ui():
 
             history.append({"role": "user", "content": message.strip()})
 
+            import time
             full_response = ""
             for partial in agent.chat_stream(message.strip(), session_id):
                 full_response = partial
                 new_history = history + [{"role": "assistant", "content": full_response}]
                 yield "", new_history
+                time.sleep(0.03)  # 30ms 间隔，让前端逐段渲染
 
             yield "", history + [{"role": "assistant", "content": full_response}]
 

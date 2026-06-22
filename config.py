@@ -86,6 +86,12 @@ SESSION_TITLE_PREFIX_LEN = 30  # 会话标题截取长度
 MAX_FILE_SIZE_MB = 50
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt", ".md", ".csv"}
 
+# ===== Token 计费 =====
+# DeepSeek API 官方价格（deepseek-chat，2025年更新）
+# 参考: https://api-docs.deepseek.com/quick_start/pricing
+DEEPSEEK_INPUT_PRICE_PER_1K = 0.00027       # $0.27 / 1M input tokens
+DEEPSEEK_OUTPUT_PRICE_PER_1K = 0.0011       # $1.10 / 1M output tokens
+
 # ===== Gradio 配置 =====
 GRADIO_SERVER_PORT = 7860
 GRADIO_SHARE = False  # 设为 True 可生成外网链接

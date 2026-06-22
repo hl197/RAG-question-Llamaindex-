@@ -39,6 +39,10 @@ class DeepSeekLLM(LLM):
     max_tokens: int = 4096
     context_window: int = 65536
 
+    # Token 用量累积（从 API 响应中提取）
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+
     def __init__(
         self,
         model: str = "deepseek-chat",
@@ -79,6 +83,16 @@ class DeepSeekLLM(LLM):
             num_output=self.max_tokens,
             is_chat_model=True,
         )
+
+    # ── Token 用量查询 ──────────────────────────
+
+    def get_token_usage(self) -> dict:
+        """获取从启动到现在的累积 token 消耗"""
+        return {
+            "prompt_tokens": self.total_prompt_tokens,
+            "completion_tokens": self.total_completion_tokens,
+            "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,
+        }
 
     # ── 指数退避重试 ─────────────────────────────
 
@@ -122,9 +136,20 @@ class DeepSeekLLM(LLM):
         )
 
         reply = response.choices[0].message.content or ""
+
+        # 提取 token 用量
+        prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+        completion_tokens = response.usage.completion_tokens if response.usage else 0
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+
         return ChatResponse(
             message=ChatMessage(role=MessageRole.ASSISTANT, content=reply),
             raw=response,
+            additional_kwargs={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            },
         )
 
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
@@ -139,7 +164,20 @@ class DeepSeekLLM(LLM):
         )
 
         text = response.choices[0].message.content or ""
-        return CompletionResponse(text=text, raw=response)
+
+        prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+        completion_tokens = response.usage.completion_tokens if response.usage else 0
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+
+        return CompletionResponse(
+            text=text,
+            raw=response,
+            additional_kwargs={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            },
+        )
 
     # ── 流式接口（必要实现） ──────────────────────
 
@@ -210,7 +248,10 @@ class DeepSeekLLM(LLM):
     def _stream_chat_to_gen(self, stream) -> ChatResponseGen:
         """将 OpenAI 流式响应转成 ChatResponseGen"""
         full_text = ""
+        last_usage = None
         for chunk in stream:
+            if chunk.usage:
+                last_usage = chunk.usage
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
                 full_text += delta.content
@@ -223,14 +264,26 @@ class DeepSeekLLM(LLM):
                     raw=chunk,
                 )
 
+        # 流结束后累积 token 用量（在最后一个 chunk 中返回）
+        if last_usage:
+            self.total_prompt_tokens += last_usage.prompt_tokens or 0
+            self.total_completion_tokens += last_usage.completion_tokens or 0
+
     def _stream_complete_to_gen(self, stream) -> CompletionResponseGen:
         """将 OpenAI 流式响应转成 CompletionResponseGen"""
         full_text = ""
+        last_usage = None
         for chunk in stream:
+            if chunk.usage:
+                last_usage = chunk.usage
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
                 full_text += delta.content
                 yield CompletionResponse(text=full_text, delta=delta.content, raw=chunk)
+
+        if last_usage:
+            self.total_prompt_tokens += last_usage.prompt_tokens or 0
+            self.total_completion_tokens += last_usage.completion_tokens or 0
 
     # ── 序列化 ──
 
