@@ -34,7 +34,9 @@ class PersistentChatMemory:
     def _init_db(self):
         """创建数据库表（如不存在）"""
         import os
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
 
         conn = self._get_conn()
         try:
