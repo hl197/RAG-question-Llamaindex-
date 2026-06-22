@@ -1,7 +1,12 @@
+写一个专门的llm类用于从环境变量中加载api，供其他类调用llm
+写一个数据结构类，用来规范各部分的参数接口规范
+
+
+
 # 错误记录与解决方案
 
 > 本文档记录开发过程中遇到的所有错误及其解决方案。
-> 最后更新: 2026-06-21
+> 最后更新: 2026-06-22
 
 ---
 
@@ -199,12 +204,88 @@ AssertionError at resolve_embed_model()
 
 ---
 
+## 13. pymupdf4llm 导入路径变更
+
+**错误**:
+```
+上传失败: 处理失败: 请安装 pymupdf4llm: pip install pymupdf4llm
+```
+但 `pymupdf4llm` 实际已安装。
+
+**根因**: `pymupdf4llm` 1.27.2.3 版本中 `LlamaMarkdownReader` 从 `pymupdf4llm.llama` 移到了 `pymupdf4llm` 顶层。
+
+**解决**: 
+```python
+# 错误
+from pymupdf4llm.llama import LlamaMarkdownReader
+
+# 正确
+from pymupdf4llm import LlamaMarkdownReader
+```
+
+**关键文件**: `knowledge/loader.py`
+
+---
+
+## 14. 系统 HTTP_PROXY 环境变量干扰 API 直连
+
+**错误**:
+```
+对话时 → Connection error 或 Authentication Fails (governor)
+```
+但直接测试 `api.deepseek.com` 的网络连接是通的（DNS 解析成功、TCP 连得上）。
+
+**根因**: 系统设置了 `HTTP_PROXY=http://127.0.0.1:9674`，且代理客户端未运行。Python 的 httpx 库在创建客户端时自动读取该环境变量走代理，导致请求被拒绝。
+
+**解决过程**:
+1. ❌ `httpx.Client(proxy=None)` — 无效，httpx 仍读取环境变量
+2. ❌ `httpx.Client(mounts={})` — 无效，内部默认传输层仍读取环境变量
+3. ❌ `os.environ.pop("HTTP_PROXY")` — 只对当前进程有效，openai SDK 内部有缓存
+4. ❌ `NO_PROXY=api.deepseek.com` — httpx 部分版本不识别
+5. ✅ `httpx.HTTPTransport(proxy=None)` — 在传输层彻底禁用代理
+
+**方案对比**:
+| 方法 | 效果 | 说明 |
+|------|------|------|
+| `os.environ.pop()` | 部分有效 | 在当前进程清除，但 httpx 有内部缓存 |
+| `httpx.Client(proxy=None)` | ❌ 无效 | 文档说绕过代理，实际仍读环境变量 |
+| `httpx.Client(mounts={})` | ❌ 无效 | 挂载点清空后默认传输层仍读代理 |
+| `httpx.HTTPTransport(proxy=None)` | ✅ 有效 | 在传输层彻底禁用代理读取 |
+| `NO_PROXY` 环境变量 | 辅助有效 | 需配合传输层方案一起使用 |
+| `create_llm()` 适配器 | 架构改进 | 统一集中管理配置加载 |
+
+**关键文件**: `agent/deepseek_llm.py`、`config.py`、`agent/llm_adapter.py`（新文件）
+
+---
+
+## 15. DeepSeek API 间歇性 Authentication Fails
+
+**错误**:
+```
+第一次调用连接正常，后续某些调用出现:
+Authentication Fails (governor)
+```
+或反过来：第一次失败，第二次成功。
+
+**根因**: 疑似 DeepSeek API 服务端网关（governor）的间歇性问题。`governor` 是 DeepSeek 的 API 网关组件，在某些请求频率或上下文长度下会返回认证失败。该错误在直接测试时无法稳定复现，仅在 Agent 的多轮调用中出现。
+
+**解决**:
+1. 添加连接预热（Agent 初始化时发一条测试请求）
+2. 添加自动重试机制（第一次失败时重建 Agent 再试）
+3. 改进错误日志输出（显示完整 traceback 和异常类型）
+
+**关键文件**: `agent/rag_agent.py`
+
+---
+
 ## 汇总：按文件相关
 
 | 文件 | 错误数 | 主要问题类型 |
 |------|--------|-------------|
 | `knowledge/local_embedding.py` | 3 | Pydantic 字段校验 (#6)、BaseEmbedding 继承 (#12) |
-| `agent/deepseek_llm.py` | 3 | Pydantic 字段校验 (#7)、缺少抽象方法 (#9) |
-| `agent/rag_agent.py` | 2 | Tool 构造参数错误 (#10, #11) |
+| `agent/deepseek_llm.py` | 4 | Pydantic 字段校验 (#7)、缺少抽象方法 (#9)、httpx 代理绕过 (#14) |
+| `agent/rag_agent.py` | 3 | Tool 构造参数错误 (#10, #11)、重试机制 (#15) |
+| `agent/llm_adapter.py` | 1 | 新文件：LLM 配置适配器 (#14) |
 | `app.py` | 4 | Gradio 6.x API 不兼容 (#2) |
-| `config.py` | 1 | Embedding 配置项变更 (#1) |
+| `config.py` | 2 | Embedding 配置项变更 (#1)、NO_PROXY 设置 (#14) |
+| `knowledge/loader.py` | 1 | pymupdf4llm 导入路径变更 (#13) |

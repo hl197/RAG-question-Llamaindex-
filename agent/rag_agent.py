@@ -13,8 +13,8 @@ from llama_index.core.agent.react import ReActAgentWorker
 from llama_index.core.tools import QueryEngineTool, FunctionTool
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
-from agent.deepseek_llm import DeepSeekLLM
 from knowledge.local_embedding import LocalEmbedding
+from agent.llm_adapter import create_llm
 
 import config
 from knowledge import loader, indexer
@@ -31,13 +31,9 @@ class RAGAgent:
         agent.chat("张三有什么项目经验？", session_id="abc123")
     """
 
-    def __init__(self):
-        # ── LLM（DeepSeek 自定义封装，绕过 OpenAl 模型名校验） ──
-        self.llm = DeepSeekLLM(
-            model=config.LLM_MODEL,
-            api_key=config.DEEPSEEK_API_KEY,
-            api_base=config.DEEPSEEK_BASE_URL,
-        )
+    def __init__(self, api_key: Optional[str] = None, api_base: Optional[str] = None):
+        # ── LLM（通过适配器创建，自动从环境变量/.env加载配置） ──
+        self.llm = create_llm(api_key=api_key, api_base=api_base)
         Settings.llm = self.llm
 
         # ── Embedding（纯本地，无需模型下载） ──
@@ -55,6 +51,18 @@ class RAGAgent:
         self.memory = PersistentChatMemory()
         self.current_session_id: Optional[str] = None
 
+        # ── 启动时检测 LLM 连接 ──
+        self._warmup_llm()
+
+    def _warmup_llm(self):
+        """启动时检测 LLM 连接是否正常"""
+        try:
+            resp = self.llm.complete("回复OK即可")
+            print(f"✅ LLM 连接正常: {str(resp)[:40]}")
+        except Exception as e:
+            print(f"⚠️  LLM 启动检测失败: {type(e).__name__}: {e}")
+            print("   首次对话时可能需要等待连接重建。")
+
     # ── Agent 初始化 ──────────────────────────────
 
     def _build_tools(self) -> List:
@@ -67,9 +75,13 @@ class RAGAgent:
             query_engine=query_engine,
             name="knowledge_base",
             description=(
-                "检索知识库中的文档内容。"
-                "当用户询问知识库中的具体信息时使用此工具。"
-                "输入应为自然语言问题。"
+                "检索知识库中的文档实际内容，返回最相关的原文片段。\n"
+                "当用户询问某份文件的具体信息、查找文档中的某个主题或细节时，"
+                "必须使用此工具。输入应为自然语言问题，例如：\n"
+                "  - 「张三的项目经验是什么？」\n"
+                "  - 「Happy-LLM 这本书讲了什么？」\n"
+                "  - 「文档中关于 Python 的内容」\n"
+                "注意：这是按语义相似度检索内容，不是按文件名搜索。"
             ),
         )
         tools.append(rag_tool)
@@ -79,9 +91,11 @@ class RAGAgent:
             fn=self._get_knowledge_summary,
             name="knowledge_summary",
             description=(
-                "获取知识库的整体摘要统计信息，包括已上传的文件列表、"
-                "文档数量和内容概况。当用户问[知识库里有什么]、"
-                "[总结一下文档内容]等全局性问题时使用。"
+                "获取知识库的整体概况，包括已上传的文件列表、"
+                "文档数量和内容概况。\n"
+                "当用户问「知识库里有什么」、「上传了哪些文件」、「有几份文档」"
+                "等知识库整体情况时使用。\n"
+                "不要用这个工具来查找具体内容——那是 knowledge_base 的职责。"
             ),
         )
         tools.append(summary_tool)
@@ -164,12 +178,33 @@ class RAGAgent:
         # 保存用户消息
         self.memory.save_message(session_id, "user", message)
 
-        # Agent 处理
-        try:
-            response = self._agent.chat(message)
-            reply = str(response)
-        except Exception as e:
-            reply = f"抱歉，处理时出错: {str(e)}"
+        # Agent 处理（带自动重试）
+        import traceback
+
+        for attempt in range(2):
+            try:
+                response = self._agent.chat(message)
+                reply = str(response)
+                break  # 成功，跳出重试循环
+            except Exception as e:
+                error_detail = traceback.format_exc()
+                # 控制台打印完整异常
+                print(f"\n{'='*50}")
+                print(f"❌ Agent 调用出错 (第{attempt+1}次)")
+                print(f"   异常类型: {type(e).__name__}")
+                print(f"   异常信息: {e}")
+                print(f"   完整 traceback:")
+                print(f"{error_detail}")
+                print(f"{'='*50}\n")
+
+                if attempt == 0:
+                    # 第一次失败，重建 Agent 后重试
+                    print("🔄 重建 Agent 并重试...")
+                    self._agent = self._create_agent()
+                    self._init_session_memory(session_id)
+                else:
+                    # 第二次仍失败，给用户显示详细错误
+                    reply = f"抱歉，处理时出错: {type(e).__name__}: {e}"
 
         # 保存助手回复
         self.memory.save_message(session_id, "assistant", reply)
@@ -182,12 +217,15 @@ class RAGAgent:
         system_msg = ChatMessage(
             role=MessageRole.SYSTEM,
             content=(
-                "你是一个智能文档问答助手。你可以：\n"
-                "1. 检索知识库中的文档内容回答用户问题（使用 knowledge_base 工具）\n"
-                "2. 总结分析知识库中的整体内容（使用 knowledge_summary 工具）\n"
-                "3. 基于对话历史进行上下文理解\n\n"
-                "请基于知识库中的内容回答问题。如果知识库中没有相关信息，"
-                "请如实告知用户。"
+                "你是一个智能文档问答助手。你的核心职责是基于知识库中的文档回答用户问题。\n\n"
+                "【必须遵守的规则】\n"
+                "1. 当用户询问知识库中的具体信息或文档内容时，**必须**使用 knowledge_base 工具\n"
+                "   检索知识库，不得依赖自身知识回答。\n"
+                "2. 当用户问「知识库里有什么」、「总结一下文档」等全局性问题时，使用\n"
+                "   knowledge_summary 工具获取文件列表和统计信息。\n"
+                "3. 每次回答前先判断是否需要检索知识库，需要时先用工具再回答。\n"
+                "4. 检索后如果知识库中确实没有相关信息，如实告知用户。\n"
+                "5. 闲聊或问候可以直接回应，不需要使用工具。"
             ),
         )
         self._agent.memory.put(system_msg)

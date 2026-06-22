@@ -13,6 +13,14 @@ import base64
 from pathlib import Path
 from dotenv import load_dotenv
 
+# 添加 DeepSeek/OpenAI API 域名到 no_proxy，绕过系统代理直连
+_existing_no_proxy = os.environ.get("NO_PROXY", "")
+_domains = "api.deepseek.com,api.openai.com"
+if _existing_no_proxy:
+    os.environ["NO_PROXY"] = f"{_existing_no_proxy},{_domains}"
+else:
+    os.environ["NO_PROXY"] = _domains
+
 # 显式指定 .env 路径（避免工作目录不一致导致加载失败）
 _env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=str(_env_path))

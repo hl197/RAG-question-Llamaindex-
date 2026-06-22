@@ -64,7 +64,7 @@ def load_document(file_path: str) -> List[Document]:
 def _load_pdf(path: Path) -> List[Document]:
     """使用 PyMuPDF4LLM 解析 PDF，保留表格/标题层级"""
     try:
-        from pymupdf4llm.llama import LlamaMarkdownReader
+        from pymupdf4llm import LlamaMarkdownReader
 
         reader = LlamaMarkdownReader()
         docs = reader.load_data(str(path))

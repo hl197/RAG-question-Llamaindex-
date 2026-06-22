@@ -4,6 +4,8 @@ DeepSeek LLM 封装 —— 兼容 LlamaIndex LLM 接口。
 使用 OpenAI SDK 协议调用 DeepSeek API，绕开 llama-index OpenAI 包装类的模型名校验。
 """
 
+import asyncio
+import httpx
 from typing import Any, Optional, Sequence, List, Generator
 
 from llama_index.core.llms import (
@@ -55,9 +57,16 @@ class DeepSeekLLM(LLM):
             **kwargs,
         )
         # Pydantic 不允许直接 setattr 未声明的字段，用 object.__setattr__ 存客户端
+        # 使用独立 httpx 客户端，显式禁用代理（HTTPTransport(proxy=None) 才能绕过
+        # 系统 HTTP_PROXY/HTTPS_PROXY 环境变量，Client(mounts={}) 无效）
+        object.__setattr__(self, "_http_client", httpx.Client(
+            transport=httpx.HTTPTransport(proxy=None),
+            follow_redirects=True,
+        ))
         object.__setattr__(self, "_client", OpenAIClient(
             api_key=self.api_key,
             base_url=self.api_base,
+            http_client=self._http_client,
         ))
 
     @property
