@@ -384,8 +384,9 @@ class PersistentChatMemory:
                 token_count=self.estimate_tokens(session_id),
             )
 
-            # 重建 SQLite 中的历史为摘要 + 最近消息
+            # 重建 SQLite 中的历史为摘要 + 最近消息（事务保护）
             with self._connect() as conn:
+                conn.execute("BEGIN")
                 conn.execute(
                     "DELETE FROM conversations WHERE session_id = ?",
                     (session_id,),

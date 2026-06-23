@@ -16,6 +16,9 @@ from llama_index.core.tools import QueryEngineTool, FunctionTool
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
 from knowledge.local_embedding import LocalEmbedding
+from knowledge.query_decomposer import QueryDecomposer
+from knowledge.hybrid_retriever import HybridRetriever
+from knowledge.reranker import Reranker
 from agent.llm_adapter import create_llm
 
 import config
@@ -63,9 +66,11 @@ Below is the current conversation consisting of interleaving human and assistant
 # 后置过滤：从 Agent 回复中剥离 ReAct 追踪文本，只保留最终答案
 def _strip_react_trace(text: str) -> str:
     # 从 Agent 原始输出中提取最终答案，去掉 ReAct 中间步骤
-    # 1) 如果包含 "Answer:"，取最后一个 "Answer:" 之后的内容（应对多步推理）
-    if "Answer:" in text:
-        return text.rsplit("Answer:", 1)[-1].strip()
+    # 1) 如果包含行首 "Answer:"，取最后一个 "Answer:" 之后的内容（应对多步推理）
+    if "\nAnswer:" in text:
+        return text.rsplit("\nAnswer:", 1)[-1].strip()
+    if text.startswith("Answer:"):
+        return text.split("Answer:", 1)[-1].strip()
     # 2) 如果包含 "Action:"，说明工具调用步骤泄露了，尝试取 "Action:" 之前的内容
     if "Action:" in text:
         parts = text.split("Action:", 1)
@@ -115,8 +120,12 @@ class RAGAgent:
         self.llm = create_llm(api_key=api_key, api_base=api_base)
         Settings.llm = self.llm
 
-        # ── Embedding（纯本地，无需模型下载） ──
-        embed_model = LocalEmbedding(dim=config.EMBED_DIM)
+        # ── Embedding（根据配置选择类型） ──
+        if config.EMBED_TYPE == "semantic":
+            from knowledge.semantic_embedding import SemanticEmbedding
+            embed_model = SemanticEmbedding()
+        else:
+            embed_model = LocalEmbedding(dim=config.EMBED_DIM)
         Settings.embed_model = embed_model
 
         # ── 索引 ──
@@ -151,21 +160,36 @@ class RAGAgent:
         """创建 Agent 工具列表"""
         tools = []
 
-        # Tool 1: 知识库检索
-        query_engine = indexer.get_query_engine()
-        rag_tool = QueryEngineTool.from_defaults(
-            query_engine=query_engine,
-            name="knowledge_base",
-            description=(
-                "检索知识库中的文档实际内容，返回最相关的原文片段。\n"
-                "当用户询问某份文件的具体信息、查找文档中的某个主题或细节时，"
-                "必须使用此工具。输入应为自然语言问题，例如：\n"
-                "  - 「张三的项目经验是什么？」\n"
-                "  - 「Happy-LLM 这本书讲了什么？」\n"
-                "  - 「文档中关于 Python 的内容」\n"
-                "注意：这是按语义相似度检索内容，不是按文件名搜索。"
-            ),
-        )
+        # Tool 1: 知识库检索（支持查询分解 + 混合检索 + 重排序）
+        if config.ENABLE_QUERY_DECOMPOSITION or config.ENABLE_HYBRID_RETRIEVAL or config.ENABLE_RERANKING:
+            rag_tool = FunctionTool.from_defaults(
+                fn=self._enhanced_retrieve,
+                name="knowledge_base",
+                description=(
+                    "检索知识库中的文档实际内容，返回最相关的原文片段。\n"
+                    "当用户询问某份文件的具体信息、查找文档中的某个主题或细节时，"
+                    "必须使用此工具。输入应为自然语言问题，例如：\n"
+                    "  - 「张三的项目经验是什么？」\n"
+                    "  - 「Happy-LLM 这本书讲了什么？」\n"
+                    "  - 「文档中关于 Python 的内容」\n"
+                    "注意：这是按语义相似度检索内容，不是按文件名搜索。"
+                ),
+            )
+        else:
+            query_engine = indexer.get_query_engine(similarity_score_cutoff=config.SIMILARITY_CUTOFF)
+            rag_tool = QueryEngineTool.from_defaults(
+                query_engine=query_engine,
+                name="knowledge_base",
+                description=(
+                    "检索知识库中的文档实际内容，返回最相关的原文片段。\n"
+                    "当用户询问某份文件的具体信息、查找文档中的某个主题或细节时，"
+                    "必须使用此工具。输入应为自然语言问题，例如：\n"
+                    "  - 「张三的项目经验是什么？」\n"
+                    "  - 「Happy-LLM 这本书讲了什么？」\n"
+                    "  - 「文档中关于 Python 的内容」\n"
+                    "注意：这是按语义相似度检索内容，不是按文件名搜索。"
+                ),
+            )
         tools.append(rag_tool)
 
         # Tool 2: 知识库摘要/统计
@@ -205,6 +229,66 @@ class RAGAgent:
             parts.append(f"  - {f}")
 
         return "\n".join(parts)
+
+    def _enhanced_retrieve(self, query: str) -> str:
+        """
+        增强版检索（Agent 工具调用入口）。
+
+        管线: 查询分解 → 混合检索 → 重排序 → 格式化返回
+        """
+        # Step 1: 查询分解
+        if config.ENABLE_QUERY_DECOMPOSITION:
+            decomposer = QueryDecomposer(self.llm)
+            sub_queries = decomposer.decompose(query)
+        else:
+            sub_queries = [query]
+
+        # Step 2: 对每个子查询执行检索
+        all_results = {}  # text → max_score
+        node_texts = indexer.get_node_texts()
+
+        for sq in sub_queries:
+            if config.ENABLE_HYBRID_RETRIEVAL and node_texts:
+                # 混合检索：向量 + BM25
+                def vector_query(q, k):
+                    qe = indexer.get_query_engine(similarity_top_k=k)
+                    resp = qe.query(q)
+                    return [
+                        (node.text, node.score or 0)
+                        for node in resp.source_nodes
+                    ]
+
+                hybrid = HybridRetriever(node_texts, vector_query)
+                results = hybrid.retrieve(sq, top_k=config.SIMILARITY_TOP_K)
+                for r in results:
+                    all_results[r] = max(all_results.get(r, 0), 0.5)
+            else:
+                # 标准向量检索
+                qe = indexer.get_query_engine(
+                    similarity_top_k=config.SIMILARITY_TOP_K,
+                    similarity_score_cutoff=config.SIMILARITY_CUTOFF,
+                )
+                resp = qe.query(sq)
+                for node in resp.source_nodes:
+                    text = node.text
+                    all_results[text] = max(all_results.get(text, 0), node.score or 0)
+
+        # Step 3: 重排序
+        if config.ENABLE_RERANKING and len(all_results) > config.SIMILARITY_TOP_K:
+            candidates = sorted(all_results, key=all_results.get, reverse=True)
+            reranker = Reranker(self.llm)
+            reranked = reranker.rerank(query, candidates, top_k=config.SIMILARITY_TOP_K)
+        else:
+            reranked = sorted(all_results, key=all_results.get, reverse=True)[:config.SIMILARITY_TOP_K]
+
+        # Step 4: 格式化返回
+        if not reranked:
+            return "知识库中未找到相关信息。"
+
+        parts = []
+        for i, text in enumerate(reranked, 1):
+            parts.append(f"[片段 {i}]\n{text}")
+        return "\n\n---\n\n".join(parts)
 
     def _create_agent(self) -> AgentRunner:
         """创建 AgentRunner 实例"""

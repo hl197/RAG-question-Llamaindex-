@@ -2,10 +2,15 @@
 索引构建与检索模块
 
 负责 ChromaDB 初始化、文档索引构建（增量）、查询检索。
+
+提供两套接口：
+- KnowledgeIndex 类：推荐使用，封装状态，支持多实例
+- 模块级函数：向后兼容，委托给默认单例
 """
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import List, Optional, Dict
 
@@ -26,251 +31,265 @@ from knowledge.local_embedding import LocalEmbedding
 import config
 
 
-# ── 全局单例 ──────────────────────────────────────
-_chroma_client: Optional[chromadb.PersistentClient] = None
-_vector_store: Optional[ChromaVectorStore] = None
-_storage_context: Optional[StorageContext] = None
-_index: Optional[VectorStoreIndex] = None
-_loaded_files: List[str] = []
+class KnowledgeIndex:
+    """知识库索引管理器 —— 封装 ChromaDB 连接和索引生命周期。
+
+    替代原有的模块级全局变量，消除线程安全隐患。
+    """
+
+    def __init__(self, chroma_dir: str = None):
+        self._chroma_dir = chroma_dir or config.CHROMA_DIR
+        self._client: Optional[chromadb.PersistentClient] = None
+        self._vector_store: Optional[ChromaVectorStore] = None
+        self._storage_context: Optional[StorageContext] = None
+        self._index: Optional[VectorStoreIndex] = None
+        self._loaded_files: List[str] = []
+
+        # 文件注册表路径
+        self._registry_path = os.path.join(self._chroma_dir, "file_registry.json")
+
+    # ── 属性 ────────────────────────────────────
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._index is not None
+
+    # ── Embedding 初始化 ─────────────────────────
+
+    def _init_embedding(self):
+        """初始化 Embedding 模型"""
+        if Settings.embed_model is not None:
+            return  # 已有外部设置的 embedding（如 rag_agent.py 设置的语义模型）
+
+        if config.EMBED_TYPE == "semantic":
+            from knowledge.semantic_embedding import SemanticEmbedding
+            Settings.embed_model = SemanticEmbedding()
+        else:
+            Settings.embed_model = LocalEmbedding(dim=config.EMBED_DIM)
+
+    # ── 文件注册表 ───────────────────────────────
+
+    def _save_file_registry(self):
+        """保存文件注册表"""
+        with open(self._registry_path, "w", encoding="utf-8") as f:
+            json.dump(self._loaded_files, f, ensure_ascii=False, indent=2)
+
+    def _load_file_registry(self) -> List[str]:
+        """加载文件注册表"""
+        if os.path.exists(self._registry_path):
+            with open(self._registry_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return []
+
+    def _get_collection(self):
+        """获取 ChromaDB 集合对象"""
+        if self._client is None:
+            raise RuntimeError("ChromaDB 未初始化，请先调用 init_chroma()")
+        return self._client.get_collection("knowledge_base")
+
+    # ── ChromaDB 初始化 ──────────────────────────
+
+    def init_chroma(self):
+        """初始化 ChromaDB 客户端 + 向量存储 + 索引"""
+        if self._index is not None:
+            return
+
+        self._init_embedding()
+        os.makedirs(self._chroma_dir, exist_ok=True)
+
+        self._client = chromadb.PersistentClient(path=self._chroma_dir)
+        collection = self._client.get_or_create_collection(
+            name="knowledge_base",
+            metadata={"hnsw:space": "cosine"},
+        )
+
+        self._vector_store = ChromaVectorStore(chroma_collection=collection)
+        self._storage_context = StorageContext.from_defaults(vector_store=self._vector_store)
+
+        try:
+            self._index = VectorStoreIndex.from_vector_store(
+                vector_store=self._vector_store,
+                storage_context=self._storage_context,
+            )
+            print(f"✅ 从 ChromaDB 加载已有索引（共 {collection.count()} 条向量）")
+        except Exception:
+            self._index = VectorStoreIndex.from_documents(
+                documents=[],
+                storage_context=self._storage_context,
+            )
+            print("📂 创建新的空索引")
+
+        self._loaded_files = self._load_file_registry()
+
+    # ── 索引构建 ─────────────────────────────────
+
+    def build_or_update_index(self, documents: List[Document], filename: str) -> int:
+        """增量添加文档到索引。返回新增节点数。"""
+        if self._index is None:
+            raise RuntimeError("索引未初始化，请先调用 init_chroma()")
+
+        if filename in self._loaded_files:
+            print(f"⏭️ 文件已存在索引中，跳过: {filename}")
+            return 0
+
+        splitter = SentenceSplitter(
+            chunk_size=config.CHUNK_SIZE,
+            chunk_overlap=config.CHUNK_OVERLAP,
+        )
+
+        for doc in documents:
+            doc.metadata["source_file"] = filename
+
+        nodes = splitter.get_nodes_from_documents(documents)
+        self._index.insert_nodes(nodes)
+
+        self._loaded_files.append(filename)
+        self._save_file_registry()
+
+        print(f"✅ 已索引文件: {filename}（{len(nodes)} 个文本块）")
+        return len(nodes)
+
+    # ── 检索引擎 ─────────────────────────────────
+
+    def get_query_engine(
+        self,
+        similarity_top_k: Optional[int] = None,
+        similarity_score_cutoff: Optional[float] = None,
+    ) -> RetrieverQueryEngine:
+        """获取查询引擎"""
+        if self._index is None:
+            raise RuntimeError("索引未初始化，请先调用 init_chroma()")
+
+        top_k = similarity_top_k or config.SIMILARITY_TOP_K
+
+        retriever = VectorIndexRetriever(index=self._index, similarity_top_k=top_k)
+
+        postprocessors = []
+        if similarity_score_cutoff is not None:
+            postprocessors.append(
+                SimilarityPostprocessor(similarity_cutoff=similarity_score_cutoff)
+            )
+
+        return RetrieverQueryEngine.from_args(
+            retriever=retriever,
+            node_postprocessors=postprocessors,
+            llm=None,
+        )
+
+    def get_node_texts(self) -> List[str]:
+        """返回索引中所有文档分块的文本列表（供混合检索使用）"""
+        if self._index is None:
+            return []
+        try:
+            nodes = self._index.docstore.docs.values()
+            return [node.text for node in nodes if hasattr(node, "text")]
+        except Exception:
+            return []
+
+    # ── 文件管理 ─────────────────────────────────
+
+    def remove_file(self, filename: str) -> bool:
+        """从 ChromaDB 中删除指定文件名的所有文档片段"""
+        try:
+            collection = self._get_collection()
+            collection.delete(where={"filename": filename})
+
+            self._loaded_files = self._load_file_registry()
+            if filename in self._loaded_files:
+                self._loaded_files.remove(filename)
+                self._save_file_registry()
+
+            print(f"✅ 已从知识库中删除: {filename}")
+            return True
+        except Exception as e:
+            print(f"❌ 删除文件失败: {e}")
+            return False
+
+    def list_uploaded_files(self) -> List[str]:
+        """返回已上传的文件名列表"""
+        if not self._loaded_files:
+            self._loaded_files = self._load_file_registry()
+        return list(self._loaded_files)
+
+    def clear_knowledge_base(self):
+        """清空知识库（删除所有向量 + 注册表）"""
+        self.close()
+
+        if os.path.exists(self._chroma_dir):
+            shutil.rmtree(self._chroma_dir)
+            print("🗑️ 已清空 ChromaDB 数据")
+
+        self._vector_store = None
+        self._storage_context = None
+        self._index = None
+        self._loaded_files = []
+
+    def get_collection_stats(self) -> Dict:
+        """返回集合统计信息"""
+        try:
+            collection = self._get_collection()
+            return {
+                "total_vectors": collection.count(),
+                "files_count": len(self.list_uploaded_files()),
+                "files": self.list_uploaded_files(),
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def close(self):
+        """关闭 ChromaDB 客户端，释放文件锁"""
+        if self._client is not None:
+            try:
+                self._client._system.stop()
+            except Exception:
+                pass
+            self._client = None
 
 
-# ── Embedding 初始化 ──────────────────────────────
-def _init_embedding():
-    """初始化本地 Embedding 模型（零下载，纯 numpy）"""
-    if Settings.embed_model is None or not isinstance(
-        Settings.embed_model, LocalEmbedding
-    ):
-        embed_model = LocalEmbedding(dim=config.EMBED_DIM)
-        Settings.embed_model = embed_model
+# ── 默认单例 + 向后兼容的模块级函数 ─────────────────
 
 
-# ── ChromaDB 初始化 ──────────────────────────────
+_default_index: Optional[KnowledgeIndex] = None
+
+
+def _get_default() -> KnowledgeIndex:
+    """获取默认 KnowledgeIndex 单例"""
+    global _default_index
+    if _default_index is None:
+        _default_index = KnowledgeIndex()
+    return _default_index
+
+
 def init_chroma():
-    """
-    初始化 ChromaDB 客户端 + 向量存储 + 索引。
-    如果已有数据则加载，否则创建空索引。
-    """
-    global _chroma_client, _vector_store, _storage_context, _index, _loaded_files
-
-    if _index is not None:
-        return  # 已初始化
-
-    _init_embedding()
-
-    # 确保目录存在
-    os.makedirs(config.CHROMA_DIR, exist_ok=True)
-
-    # 连接/创建 ChromaDB
-    _chroma_client = chromadb.PersistentClient(path=config.CHROMA_DIR)
-    collection = _chroma_client.get_or_create_collection(
-        name="knowledge_base",
-        metadata={"hnsw:space": "cosine"},
-    )
-
-    _vector_store = ChromaVectorStore(chroma_collection=collection)
-    _storage_context = StorageContext.from_defaults(vector_store=_vector_store)
-
-    # 尝试从已有数据恢复索引
-    try:
-        _index = VectorStoreIndex.from_vector_store(
-            vector_store=_vector_store,
-            storage_context=_storage_context,
-        )
-        print(f"✅ 从 ChromaDB 加载已有索引（共 {collection.count()} 条向量）")
-    except Exception:
-        # 没有数据，创建空索引
-        _index = VectorStoreIndex.from_documents(
-            documents=[],
-            storage_context=_storage_context,
-        )
-        print("📂 创建新的空索引")
-
-    # 加载已上传文件列表
-    _loaded_files = _load_file_registry()
+    _get_default().init_chroma()
 
 
-# ── 文件注册表（记录已上传的文件） ──────────────
-_FILE_REGISTRY_PATH = os.path.join(config.CHROMA_DIR, "file_registry.json")
+def build_or_update_index(documents: List[Document], filename: str) -> int:
+    return _get_default().build_or_update_index(documents, filename)
 
 
-def _save_file_registry():
-    """保存文件注册表"""
-    with open(_FILE_REGISTRY_PATH, "w", encoding="utf-8") as f:
-        json.dump(_loaded_files, f, ensure_ascii=False, indent=2)
-
-
-def _load_file_registry() -> List[str]:
-    """加载文件注册表"""
-    if os.path.exists(_FILE_REGISTRY_PATH):
-        with open(_FILE_REGISTRY_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
-
-def _get_collection():
-    """获取 ChromaDB 集合对象"""
-    if _chroma_client is None:
-        raise RuntimeError("ChromaDB 未初始化，请先调用 init_chroma()")
-    return _chroma_client.get_collection("knowledge_base")
-
-
-# ── 索引构建 ──────────────────────────────────────
-def build_or_update_index(
-    documents: List[Document],
-    filename: str,
-) -> int:
-    """
-    增量添加文档到索引。
-
-    Args:
-        documents: 解析后的 Document 列表
-        filename: 来源文件名
-
-    Returns:
-        int: 新增的节点数
-
-    Raises:
-        RuntimeError: 索引未初始化
-    """
-    global _index
-
-    if _index is None:
-        raise RuntimeError("索引未初始化，请先调用 init_chroma()")
-
-    if filename in _loaded_files:
-        print(f"⏭️ 文件已存在索引中，跳过: {filename}")
-        return 0
-
-    # 文本分块
-    splitter = SentenceSplitter(
-        chunk_size=config.CHUNK_SIZE,
-        chunk_overlap=config.CHUNK_OVERLAP,
-    )
-
-    # 为文档添加文件名元数据
-    for doc in documents:
-        doc.metadata["source_file"] = filename
-
-    # 分块并插入索引
-    nodes = splitter.get_nodes_from_documents(documents)
-    _index.insert_nodes(nodes)
-
-    # 记录已上传文件
-    _loaded_files.append(filename)
-    _save_file_registry()
-
-    print(f"✅ 已索引文件: {filename}（{len(nodes)} 个文本块）")
-    return len(nodes)
-
-
-# ── 检索引擎 ──────────────────────────────────────
 def get_query_engine(
     similarity_top_k: Optional[int] = None,
     similarity_score_cutoff: Optional[float] = None,
 ) -> RetrieverQueryEngine:
-    """
-    获取查询引擎。
-
-    Args:
-        similarity_top_k: 返回 top-k 结果（默认 config.SIMILARITY_TOP_K）
-        similarity_score_cutoff: 相似度阈值过滤
-
-    Returns:
-        RetrieverQueryEngine
-    """
-    if _index is None:
-        raise RuntimeError("索引未初始化，请先调用 init_chroma()")
-
-    top_k = similarity_top_k or config.SIMILARITY_TOP_K
-
-    retriever = VectorIndexRetriever(
-        index=_index,
-        similarity_top_k=top_k,
-    )
-
-    postprocessors = []
-    if similarity_score_cutoff is not None:
-        postprocessors.append(
-            SimilarityPostprocessor(similarity_cutoff=similarity_score_cutoff)
-        )
-
-    query_engine = RetrieverQueryEngine.from_args(
-        retriever=retriever,
-        node_postprocessors=postprocessors,
-        llm=None,  # 让 Agent 自己走 LLM
-    )
-
-    return query_engine
+    return _get_default().get_query_engine(similarity_top_k, similarity_score_cutoff)
 
 
-# ── 工具函数 ──────────────────────────────────────
+def get_node_texts() -> List[str]:
+    return _get_default().get_node_texts()
+
+
 def remove_file(filename: str) -> bool:
-    """
-    从 ChromaDB 中删除指定文件名的所有文档片段。
-
-    Args:
-        filename: 文件名（如 "简历.pdf"）
-
-    Returns:
-        bool: 是否成功删除
-    """
-    global _loaded_files
-
-    try:
-        collection = _get_collection()
-        # 按文件名元数据过滤删除
-        collection.delete(where={"filename": filename})
-
-        # 更新 file_registry
-        _loaded_files = _load_file_registry()
-        if filename in _loaded_files:
-            _loaded_files.remove(filename)
-            _save_file_registry()
-
-        print(f"✅ 已从知识库中删除: {filename}")
-        return True
-    except Exception as e:
-        print(f"❌ 删除文件失败: {e}")
-        return False
+    return _get_default().remove_file(filename)
 
 
 def list_uploaded_files() -> List[str]:
-    """返回已上传的文件名列表"""
-    global _loaded_files
-
-    if not _loaded_files:
-        _loaded_files = _load_file_registry()
-    return list(_loaded_files)
+    return _get_default().list_uploaded_files()
 
 
 def clear_knowledge_base():
-    """
-    清空知识库（删除所有向量 + 注册表）。
-    需要重新 init_chroma() 才能使用。
-    """
-    global _chroma_client, _vector_store, _storage_context, _index, _loaded_files
-
-    import shutil
-
-    if os.path.exists(config.CHROMA_DIR):
-        shutil.rmtree(config.CHROMA_DIR)
-        print("🗑️ 已清空 ChromaDB 数据")
-
-    _chroma_client = None
-    _vector_store = None
-    _storage_context = None
-    _index = None
-    _loaded_files = []
+    _get_default().clear_knowledge_base()
 
 
 def get_collection_stats() -> Dict:
-    """返回集合统计信息"""
-    try:
-        collection = _get_collection()
-        return {
-            "total_vectors": collection.count(),
-            "files_count": len(list_uploaded_files()),
-            "files": list_uploaded_files(),
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    return _get_default().get_collection_stats()

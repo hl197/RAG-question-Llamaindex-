@@ -63,14 +63,26 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 # ===== 模型配置 =====
 LLM_MODEL = "deepseek-chat"
-EMBED_DIM = 256  # 本地 Embedding 向量维度（纯 numpy，无需下载模型）
+LLM_MAX_TOKENS = 8192  # 单次回答最大 token 数
+LLM_CONTEXT_WINDOW = 65536
+# Embedding 模型: "local" (纯numpy随机投影) 或 "semantic" (sentence-transformers语义模型)
+EMBED_TYPE = "semantic"
+SEMANTIC_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"  # 384维，中英文
+EMBED_DIM = 256  # 仅 LocalEmbedding 使用（SemanticEmbedding 由模型决定维度）
+# 注意：修改此值后需清空 data/chroma/ 重新建索引，否则维度不匹配
 
 # ===== 分块参数 =====
-CHUNK_SIZE = 1024
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 128
 
 # ===== 检索参数 =====
-SIMILARITY_TOP_K = 5
+SIMILARITY_TOP_K = 8
+SIMILARITY_CUTOFF = 0.3  # 相似度阈值，过滤低分噪音片段
+
+# ===== Phase 3: 检索增强开关 =====
+ENABLE_QUERY_DECOMPOSITION = True  # 复杂查询自动分解为子查询
+ENABLE_HYBRID_RETRIEVAL = True     # 向量 + BM25 混合检索
+ENABLE_RERANKING = True            # 检索后 LLM 精排
 
 # ===== 数据目录 =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +104,38 @@ ALLOWED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt", ".md", ".csv"}
 DEEPSEEK_INPUT_PRICE_PER_1K = 0.00027       # $0.27 / 1M input tokens
 DEEPSEEK_OUTPUT_PRICE_PER_1K = 0.0011       # $1.10 / 1M output tokens
 
-# ===== Gradio 配置 =====
-GRADIO_SERVER_PORT = 7860
-GRADIO_SHARE = False  # 设为 True 可生成外网链接
+# ===== 日志系统 =====
+import logging
+import sys
+from pathlib import Path as _Path
+
+_LOG_FILE = _Path(__file__).parent / "data" / "app.log"
+
+
+def setup_logging(level=logging.INFO):
+    """配置全局日志系统（同时输出到控制台和文件）"""
+    _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(str(_LOG_FILE), encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    # 降低第三方库日志噪音
+    logging.getLogger("chromadb").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+
+
+def get_logger(name: str) -> logging.Logger:
+    """获取模块级 logger"""
+    return logging.getLogger(name)
+
+# ===== 服务器配置 =====
+SERVER_PORT = 7860  # HTTP 服务端口（FastAPI / Gradio 通用）
+GRADIO_SERVER_PORT = SERVER_PORT  # 向后兼容（旧 app.py 仍可用）
+GRADIO_SHARE = False  # 设为 True 可生成外网链接（仅 Gradio）

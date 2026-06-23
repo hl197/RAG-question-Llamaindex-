@@ -15,19 +15,13 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+import config as project_config  # 项目全局配置
+
 # 自动加载项目根目录的 .env 文件
 _env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=str(_env_path))
 
-# 确保 DeepSeek API 域名绕过系统代理
-_existing_no_proxy = os.environ.get("NO_PROXY", "")
-_deepseek_domain = "api.deepseek.com"
-if _deepseek_domain not in _existing_no_proxy:
-    os.environ["NO_PROXY"] = (
-        f"{_existing_no_proxy},{_deepseek_domain}"
-        if _existing_no_proxy else _deepseek_domain
-    )
-
+# 注: NO_PROXY 已由 config.py 统一设置，此处不重复
 
 @dataclass
 class LLMConfig:
@@ -37,11 +31,11 @@ class LLMConfig:
     api_key: Optional[str] = None
     api_base: Optional[str] = None
 
-    # 模型参数
-    model: str = "deepseek-chat"
+    # 模型参数（优先使用 config.py 中的值）
+    model: str = project_config.LLM_MODEL
     temperature: float = 0.7
-    max_tokens: int = 4096
-    context_window: int = 65536
+    max_tokens: int = project_config.LLM_MAX_TOKENS
+    context_window: int = project_config.LLM_CONTEXT_WINDOW
 
     # 环境变量映射：字段名 → (环境变量名, 默认值)
     _ENV_MAP = {

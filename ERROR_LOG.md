@@ -278,6 +278,30 @@ Authentication Fails (governor)
 
 ---
 
+## 16. SemanticEmbedding 加载时直连 HuggingFace 超时
+
+**错误**:
+```
+HTTPSConnectionPool(host='huggingface.co', port=443): 
+Max retries exceeded with url: /.../modules.json
+(ConnectTimeoutError)
+```
+
+**根因**: `huggingface_hub` 库在被任何代码首次导入时即读取环境变量并缓存配置。`datasets`/`ragas` 等库在 `run_eval.py` 设置 `HF_ENDPOINT`/`HF_HUB_OFFLINE` 之前已被导入，导致后续 `SemanticEmbedding.__init__` 中设置环境变量无效。
+
+**解决过程**:
+1. ❌ 在 `semantic_embedding.py` 模块级设置 env var — 无效，`huggingface_hub` 已被 `datasets` 先导入
+2. ❌ 在 `semantic_embedding.py.__init__` 中设置并传 `local_files_only=True` — 无效，transformers AutoProcessor 版本不兼容
+3. ❌ 仅设 `HF_HUB_OFFLINE=1` — 模型权重已缓存但 tokenizer/processor 配置缺失
+4. ✅ **三重保护**：
+   - bash 层：`export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_ENDPOINT=https://hf-mirror.com`
+   - Python 层：`run_eval.py` 顶部（`import sys` 之前）用 `os.environ.setdefault()` 注入三项
+   - 模块层：`semantic_embedding.py` 顶部同样 setdefault（兜底）
+
+**关键文件**: `evaluation/run_eval.py`（第 12-15 行）、`knowledge/semantic_embedding.py`
+
+---
+
 ## 汇总：按文件相关
 
 | 文件 | 错误数 | 主要问题类型 |
@@ -286,6 +310,27 @@ Authentication Fails (governor)
 | `agent/deepseek_llm.py` | 4 | Pydantic 字段校验 (#7)、缺少抽象方法 (#9)、httpx 代理绕过 (#14) |
 | `agent/rag_agent.py` | 3 | Tool 构造参数错误 (#10, #11)、重试机制 (#15) |
 | `agent/llm_adapter.py` | 1 | 新文件：LLM 配置适配器 (#14) |
-| `app.py` | 4 | Gradio 6.x API 不兼容 (#2) |
+| `app.py`（已废弃，被 server.py 替代） | 4 | Gradio 6.x API 不兼容 (#2) |
+| `server.py`（新增） | — | FastAPI 替代 Gradio，SSE 流式 + REST API |
 | `config.py` | 2 | Embedding 配置项变更 (#1)、NO_PROXY 设置 (#14) |
 | `knowledge/loader.py` | 1 | pymupdf4llm 导入路径变更 (#13) |
+| `knowledge/semantic_embedding.py` | 1 | HF 离线加载环境变量注入顺序 (#16) |
+| `evaluation/run_eval.py` | 1 | HF 离线加载环境变量注入顺序 (#16) |
+
+---
+
+## 17. SSL_CERT_FILE 指向错误的 conda 安装
+
+**错误**:
+```
+FileNotFoundError: [Errno 2] No such file or directory
+ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
+```
+
+**根因**: 系统存在两个 conda 安装：`D:\Miniconda3`（base）和 `C:\Users\86182\.conda\`（all-in-rag 环境）。`~/.bash_profile` 中 `SSL_CERT_FILE=$CONDA_HOME/Library/ssl/cacert.pem` 指向 base conda 的证书路径，但实际运行环境是 `all-in-rag`，httpx 读取 `SSL_CERT_FILE` 时找到的路径在 base conda 下不存在。
+
+**解决过程**:
+1. ❌ 修改 `SSL_CERT_FILE` 指向 `all-in-rag` 环境路径 — 治标不治本，每次切换环境都要改
+2. ✅ **在 `deepseek_llm.py` 中使用 `certifi.where()` 自动定位证书**，不再依赖 `SSL_CERT_FILE` 环境变量
+
+**关键文件**: `agent/deepseek_llm.py`（httpx.HTTPTransport 添加 `verify=certifi.where()`）

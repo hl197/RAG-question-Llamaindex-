@@ -5,6 +5,7 @@ DeepSeek LLM 封装 —— 兼容 LlamaIndex LLM 接口。
 """
 
 import asyncio
+import certifi
 import httpx
 import random
 import time
@@ -66,7 +67,7 @@ class DeepSeekLLM(LLM):
         # 使用独立 httpx 客户端，显式禁用代理（HTTPTransport(proxy=None) 才能绕过
         # 系统 HTTP_PROXY/HTTPS_PROXY 环境变量，Client(mounts={}) 无效）
         object.__setattr__(self, "_http_client", httpx.Client(
-            transport=httpx.HTTPTransport(proxy=None),
+            transport=httpx.HTTPTransport(proxy=None, verify=certifi.where()),
             follow_redirects=True,
         ))
         object.__setattr__(self, "_client", OpenAIClient(

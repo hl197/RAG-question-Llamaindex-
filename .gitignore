@@ -5,12 +5,13 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
-# ChromaDB 向量数据
-data/chroma/
+# 运行时数据（向量库、对话历史、日志、文件注册表）
+data/
 
-# SQLite 对话历史
-data/conversations.db
+# 评估输出
+evaluation/eval_report.json
 
 # IDE
 .vscode/

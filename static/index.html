@@ -1,0 +1,1098 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAG 智能问答助手</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=DM+Serif+Display&display=swap" rel="stylesheet">
+<script src="/static/marked.min.js"></script>
+<style>
+/* ═══════════════════════════════════════════════════════
+   CSS Variables & Theme
+   ═══════════════════════════════════════════════════════ */
+:root {
+  --bg-root: #0a0a0b;
+  --bg-surface: #141416;
+  --bg-elevated: #1a1a1d;
+  --bg-hover: #1f1f23;
+  --border: #27272a;
+  --border-light: #2e2e33;
+  --text-primary: #f4f4f5;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
+  --accent: #f59e0b;
+  --accent-glow: rgba(245, 158, 11, 0.15);
+  --accent-strong: #d97706;
+  --success: #22c55e;
+  --danger: #ef4444;
+  --danger-bg: rgba(239, 68, 68, 0.1);
+  --radius: 10px;
+  --radius-sm: 6px;
+  --radius-lg: 16px;
+  --shadow: 0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.2);
+  --font-body: 'DM Sans', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-display: 'DM Serif Display', 'Noto Serif SC', serif;
+  --transition: 180ms ease;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  background: var(--bg-root);
+  overflow: hidden;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Layout — Three Panel Grid
+   ═══════════════════════════════════════════════════════ */
+.app { display: flex; height: 100vh; }
+
+/* —— Sidebars —— */
+.sidebar {
+  width: 300px;
+  min-width: 260px;
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: width var(--transition), min-width var(--transition);
+}
+
+.sidebar-right {
+  border-right: none;
+  border-left: 1px solid var(--border);
+}
+
+.sidebar-header {
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--border-light);
+  flex-shrink: 0;
+}
+
+.sidebar-header h2 {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+
+.sidebar-header .subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.sidebar-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  scroll-behavior: smooth;
+}
+
+.sidebar-scroll::-webkit-scrollbar { width: 4px; }
+.sidebar-scroll::-webkit-scrollbar-track { background: transparent; }
+.sidebar-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+
+/* —— Main Chat Area —— */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg-root);
+}
+
+.chat-header {
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.chat-header h1 {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+}
+
+.chat-header .dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 6px rgba(34,197,94,0.5);
+}
+
+.chat-header .status-text {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+/* —— Chat Messages —— */
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  scroll-behavior: smooth;
+}
+
+.chat-messages::-webkit-scrollbar { width: 5px; }
+.chat-messages::-webkit-scrollbar-track { background: transparent; }
+.chat-messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+
+.msg {
+  display: flex;
+  gap: 10px;
+  max-width: 85%;
+  animation: msgIn 280ms ease both;
+}
+
+@keyframes msgIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.msg.user { align-self: flex-end; flex-direction: row-reverse; }
+
+.msg .avatar {
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 15px;
+  flex-shrink: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-light);
+}
+
+.msg.user .avatar { background: var(--accent-glow); border-color: var(--accent); }
+
+.msg .bubble {
+  padding: 10px 14px;
+  border-radius: var(--radius-lg);
+  font-size: 14px;
+  line-height: 1.65;
+  word-break: break-word;
+}
+
+.msg.user .bubble {
+  background: var(--accent-glow);
+  border: 1px solid rgba(245,158,11,0.25);
+  border-bottom-right-radius: 4px;
+}
+
+.msg.assistant .bubble {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-light);
+  border-bottom-left-radius: 4px;
+}
+
+.msg .bubble p { margin-bottom: 8px; }
+.msg .bubble p:last-child { margin-bottom: 0; }
+.msg .bubble code {
+  background: rgba(255,255,255,0.06);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+.msg .bubble pre {
+  background: rgba(0,0,0,0.4);
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  margin: 8px 0;
+  border: 1px solid var(--border-light);
+}
+.msg .bubble pre code { background: none; padding: 0; }
+.msg .bubble ul, .msg .bubble ol { padding-left: 20px; margin: 6px 0; }
+.msg .bubble li { margin-bottom: 4px; }
+.msg .bubble blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 12px;
+  color: var(--text-secondary);
+  margin: 8px 0;
+}
+.msg .bubble strong { color: var(--accent); font-weight: 600; }
+.msg .bubble a { color: var(--accent); text-decoration: underline; }
+
+/* —— Typing indicator —— */
+.typing-indicator {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.typing-indicator span {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  animation: typingBounce 1.2s infinite both;
+}
+
+.typing-indicator span:nth-child(2) { animation-delay: 0.15s; }
+.typing-indicator span:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes typingBounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.3; }
+  30% { transform: translateY(-6px); opacity: 1; }
+}
+
+/* —— Chat Input —— */
+.chat-input-area {
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.chat-input-area textarea {
+  flex: 1;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 14px;
+  resize: none;
+  outline: none;
+  min-height: 42px;
+  max-height: 140px;
+  transition: border-color var(--transition), box-shadow var(--transition);
+  field-sizing: content;
+}
+
+.chat-input-area textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.chat-input-area textarea::placeholder { color: var(--text-muted); }
+
+.chat-input-area button {
+  width: 42px; height: 42px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: var(--bg-root);
+  cursor: pointer;
+  font-size: 18px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  transition: background var(--transition), transform var(--transition), box-shadow var(--transition);
+}
+
+.chat-input-area button:hover {
+  background: var(--accent-strong);
+  transform: scale(1.04);
+  box-shadow: 0 0 16px var(--accent-glow);
+}
+
+.chat-input-area button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Sidebar Components
+   ═══════════════════════════════════════════════════════ */
+
+/* —— Upload Zone —— */
+.upload-zone {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 22px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition);
+  margin-bottom: 12px;
+}
+
+.upload-zone:hover, .upload-zone.drag-over {
+  border-color: var(--accent);
+  background: var(--accent-glow);
+}
+
+.upload-zone .icon { font-size: 28px; margin-bottom: 6px; }
+.upload-zone .text { font-size: 13px; color: var(--text-secondary); }
+.upload-zone .hint { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+/* —— File List —— */
+.file-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  transition: background var(--transition);
+  cursor: default;
+}
+.file-item:hover { background: var(--bg-hover); }
+.file-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-item .del-btn {
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex; align-items: center; justify-content: center;
+  transition: all var(--transition);
+  flex-shrink: 0;
+}
+.file-item .del-btn:hover { background: var(--danger-bg); color: var(--danger); }
+
+/* —— Stats —— */
+.stats-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.stats-card .stat { text-align: center; }
+.stats-card .stat .val {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--accent);
+  font-family: var(--font-display);
+}
+.stats-card .stat .lbl { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
+
+/* —— Session List —— */
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  transition: all var(--transition);
+  border: 1px solid transparent;
+}
+.session-item:hover { background: var(--bg-hover); }
+.session-item.active {
+  background: var(--accent-glow);
+  border-color: rgba(245,158,11,0.3);
+}
+.session-item .title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-item .time { font-size: 11px; color: var(--text-muted); flex-shrink: 0; }
+.session-item .del-btn {
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+  transition: all var(--transition);
+  flex-shrink: 0;
+}
+.session-item .del-btn:hover { background: var(--danger-bg); color: var(--danger); }
+
+/* —— Action Buttons —— */
+.btn-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.btn {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all var(--transition);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.btn:hover { background: var(--bg-hover); border-color: var(--border-light); }
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg-root);
+  font-weight: 600;
+}
+.btn.primary:hover { background: var(--accent-strong); }
+
+.btn.danger {
+  border-color: rgba(239,68,68,0.4);
+  color: var(--danger);
+}
+.btn.danger:hover { background: var(--danger-bg); }
+
+/* —— Section —— */
+.section { margin-bottom: 16px; }
+.section-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Toast / Notification
+   ═══════════════════════════════════════════════════════ */
+.toast-container {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.toast {
+  padding: 10px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  animation: toastIn 250ms ease;
+  max-width: 360px;
+}
+
+.toast.success { border-color: rgba(34,197,94,0.4); }
+.toast.error { border-color: rgba(239,68,68,0.4); }
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(20px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* ═══════════════════════════════════════════════════════
+   Empty State
+   ═══════════════════════════════════════════════════════ */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-muted);
+  text-align: center;
+  gap: 8px;
+  padding: 40px;
+}
+.empty-state .icon { font-size: 48px; opacity: 0.2; }
+.empty-state .title { font-size: 16px; color: var(--text-secondary); }
+.empty-state .desc { font-size: 13px; max-width: 360px; }
+
+/* ═══════════════════════════════════════════════════════
+   Responsive — Collapse sidebars on narrow screens
+   ═══════════════════════════════════════════════════════ */
+@media (max-width: 900px) {
+  .sidebar { width: 0; min-width: 0; border: none; overflow: hidden; }
+  .sidebar-right { display: none; }
+  .msg { max-width: 95%; }
+}
+
+/* Toggle button for mobile */
+.sidebar-toggle {
+  display: none;
+  position: fixed;
+  bottom: 20px;
+  left: 20px;
+  z-index: 100;
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 18px;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+}
+
+@media (max-width: 900px) {
+  .sidebar-toggle { display: flex; align-items: center; justify-content: center; }
+  .sidebar.open { width: 280px; min-width: 280px; border-right: 1px solid var(--border); overflow: auto; position: fixed; top: 0; left: 0; height: 100vh; z-index: 50; }
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- ═══ LEFT SIDEBAR — Knowledge Base ═══ -->
+  <aside class="sidebar" id="kbSidebar">
+    <div class="sidebar-header">
+      <h2>知识库</h2>
+      <p class="subtitle">上传文档 · 智能检索</p>
+    </div>
+    <div class="sidebar-scroll">
+      <!-- Upload Zone -->
+      <div class="upload-zone" id="uploadZone">
+        <div class="icon">📁</div>
+        <div class="text">拖拽文件到此处上传</div>
+        <div class="hint">支持 PDF · DOCX · PPTX · TXT · MD · CSV</div>
+      </div>
+      <input type="file" id="fileInput" hidden multiple accept=".pdf,.docx,.pptx,.txt,.md,.csv">
+
+      <!-- Stats -->
+      <div class="stats-card" id="statsCard">
+        <div class="stat"><div class="val" id="statFiles">0</div><div class="lbl">文档数</div></div>
+        <div class="stat"><div class="val" id="statChunks">0</div><div class="lbl">片段数</div></div>
+      </div>
+
+      <!-- File List -->
+      <div class="section">
+        <div class="section-label">已上传文件</div>
+        <div id="fileList">
+          <div style="font-size:13px;color:var(--text-muted);padding:8px;">暂无文件</div>
+        </div>
+      </div>
+
+      <!-- Actions -->
+      <div class="btn-row">
+        <button class="btn" onclick="refreshFiles()">🔄 刷新</button>
+        <button class="btn danger" onclick="clearKnowledge()">🗑️ 清空</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ═══ MAIN — Chat ═══ -->
+  <main class="main">
+    <div class="chat-header">
+      <span class="dot"></span>
+      <h1>RAG 智能问答</h1>
+      <span class="status-text" id="statusText">就绪</span>
+    </div>
+
+    <div class="chat-messages" id="chatMessages">
+      <div class="empty-state">
+        <div class="icon">⚡</div>
+        <div class="title">开始对话</div>
+        <div class="desc">上传文档后，向 AI 提问任何关于文档内容的问题。<br>支持多文档交叉检索、流式实时回复。</div>
+      </div>
+    </div>
+
+    <div class="chat-input-area">
+      <textarea id="msgInput" rows="1" placeholder="输入你的问题，Enter 发送，Shift+Enter 换行..." onkeydown="handleKeyDown(event)"></textarea>
+      <button id="sendBtn" onclick="sendMessage()" title="发送">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polyline points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      </button>
+    </div>
+  </main>
+
+  <!-- ═══ RIGHT SIDEBAR — Sessions ═══ -->
+  <aside class="sidebar sidebar-right" id="sessionSidebar">
+    <div class="sidebar-header">
+      <h2>会话</h2>
+      <p class="subtitle" id="sessionCount">0 个会话</p>
+    </div>
+    <div class="sidebar-scroll">
+      <button class="btn primary" style="width:100%;margin-bottom:10px;" onclick="newSession()">➕ 新建会话</button>
+      <div class="section-label">历史会话</div>
+      <div id="sessionList">
+        <div style="font-size:13px;color:var(--text-muted);padding:8px;">暂无会话</div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- Mobile toggle -->
+<button class="sidebar-toggle" id="sidebarToggle" onclick="toggleSidebar()">📚</button>
+
+<!-- Toast container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+/* ═══════════════════════════════════════════════════════
+   State
+   ═══════════════════════════════════════════════════════ */
+const state = {
+  currentSessionId: null,
+  isStreaming: false,
+  messages: [], // local mirror of chat display
+};
+
+/* ═══════════════════════════════════════════════════════
+   DOM refs
+   ═══════════════════════════════════════════════════════ */
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => document.querySelectorAll(sel);
+
+const chatMessages = $('#chatMessages');
+const msgInput = $('#msgInput');
+const sendBtn = $('#sendBtn');
+const statusText = $('#statusText');
+const sessionList = $('#sessionList');
+const fileList = $('#fileList');
+const uploadZone = $('#uploadZone');
+const fileInput = $('#fileInput');
+const toastContainer = $('#toastContainer');
+const sessionCount = $('#sessionCount');
+const statFiles = $('#statFiles');
+const statChunks = $('#statChunks');
+
+/* ═══════════════════════════════════════════════════════
+   Toast
+   ═══════════════════════════════════════════════════════ */
+function toast(msg, type = '') {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  toastContainer.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 200ms'; }, 2500);
+  setTimeout(() => el.remove(), 2800);
+}
+
+/* ═══════════════════════════════════════════════════════
+   API Helpers
+   ═══════════════════════════════════════════════════════ */
+async function api(path, opts = {}) {
+  try {
+    const res = await fetch(path, opts);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return res;
+  } catch (e) {
+    if (e.message.includes('Failed to fetch') || e.message.includes('NetworkError')) {
+      throw new Error('无法连接服务器，请确认服务已启动');
+    }
+    throw e;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   Chat — SSE Streaming
+   ═══════════════════════════════════════════════════════ */
+async function sendMessage() {
+  const text = msgInput.value.trim();
+  if (!text || state.isStreaming) return;
+
+  // Ensure session
+  if (!state.currentSessionId) {
+    try {
+      const r = await (await api('/api/sessions', { method: 'POST' })).json();
+      state.currentSessionId = r.session_id;
+      refreshSessions();
+    } catch (e) {
+      toast(e.message, 'error');
+      return;
+    }
+  }
+
+  // Clear empty state
+  const emptyEl = chatMessages.querySelector('.empty-state');
+  if (emptyEl) emptyEl.remove();
+
+  // Add user message
+  addMessage('user', text);
+  msgInput.value = '';
+  msgInput.style.height = 'auto';
+
+  // Add assistant placeholder with typing indicator
+  const assistantMsg = addMessage('assistant', '', true);
+  const bubble = assistantMsg.querySelector('.bubble');
+
+  // Start streaming
+  state.isStreaming = true;
+  sendBtn.disabled = true;
+  statusText.textContent = '思考中…';
+
+  let fullText = '';
+
+  try {
+    const res = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, session_id: state.currentSessionId }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.error) {
+              fullText = `⚠️ ${data.error}`;
+            } else if (data.done) {
+              state.currentSessionId = data.session_id;
+              // 用服务端返回的完整文本兜底（确保不截断）
+              if (data.full_text && data.full_text.length > fullText.length) {
+                fullText = data.full_text;
+              }
+              refreshSessions();
+            } else if (data.token) {
+              fullText += data.token;
+              bubble.innerHTML = renderMarkdown(fullText);
+              chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+          } catch (e) { /* ignore parse errors */ }
+        }
+      }
+    }
+
+    // Remove typing indicator if still present
+    const indicator = bubble.querySelector('.typing-indicator');
+    if (indicator) indicator.remove();
+
+    if (!fullText) fullText = '（未收到回复）';
+  } catch (e) {
+    fullText = `⚠️ 错误: ${e.message}`;
+    toast(e.message, 'error');
+  }
+
+  // Final render
+  bubble.innerHTML = renderMarkdown(fullText);
+  assistantMsg.classList.add('done');
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+
+  state.isStreaming = false;
+  sendBtn.disabled = false;
+  statusText.textContent = '就绪';
+  msgInput.focus();
+}
+
+function addMessage(role, content, isStreaming = false) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = role === 'user' ? '👤' : '🤖';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+
+  if (isStreaming) {
+    bubble.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+  } else {
+    bubble.innerHTML = renderMarkdown(content);
+  }
+
+  div.appendChild(avatar);
+  div.appendChild(bubble);
+  chatMessages.appendChild(div);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  return div;
+}
+
+function renderMarkdown(text) {
+  if (!text) return '';
+  if (typeof marked !== 'undefined' && marked.parse) {
+    try {
+      const html = marked.parse(text);
+      return html.replace(/<a /g, '<a target="_blank" rel="noopener" ');
+    } catch (e) {
+      return escapeHtml(text);
+    }
+  }
+  return escapeHtml(text).replace(/\n/g, '<br>');
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Input Handling
+   ═══════════════════════════════════════════════════════ */
+function handleKeyDown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+// Auto-resize textarea
+msgInput.addEventListener('input', () => {
+  msgInput.style.height = 'auto';
+  msgInput.style.height = Math.min(msgInput.scrollHeight, 140) + 'px';
+});
+
+/* ═══════════════════════════════════════════════════════
+   Sessions
+   ═══════════════════════════════════════════════════════ */
+async function refreshSessions() {
+  try {
+    const data = await (await api('/api/sessions')).json();
+    const sessions = data.sessions || [];
+    sessionCount.textContent = `${sessions.length} 个会话`;
+
+    if (!sessions.length) {
+      sessionList.innerHTML = '<div style="font-size:13px;color:var(--text-muted);padding:8px;">暂无会话</div>';
+      return;
+    }
+
+    sessionList.innerHTML = sessions.map(s => {
+      const isActive = s.session_id === state.currentSessionId;
+      const name = s.session_name || '未命名会话';
+      const time = s.updated_at ? new Date(s.updated_at).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' }) : '';
+      return `
+        <div class="session-item ${isActive ? 'active' : ''}" onclick="switchSession('${s.session_id}')">
+          <span class="title">${escapeHtml(name)}</span>
+          <span class="time">${time}</span>
+          <button class="del-btn" onclick="event.stopPropagation();deleteSession('${s.session_id}')" title="删除">×</button>
+        </div>
+      `;
+    }).join('');
+  } catch (e) {
+    toast('加载会话失败: ' + e.message, 'error');
+  }
+}
+
+async function newSession() {
+  try {
+    const data = await (await api('/api/sessions', { method: 'POST' })).json();
+    state.currentSessionId = data.session_id;
+    state.messages = [];
+    chatMessages.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">💬</div>
+        <div class="title">新会话已创建</div>
+        <div class="desc">开始向 AI 提问吧！</div>
+      </div>
+    `;
+    refreshSessions();
+    toast('新会话已创建');
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+async function switchSession(sessionId) {
+  try {
+    state.currentSessionId = sessionId;
+    state.messages = [];
+
+    const data = await (await api(`/api/sessions/${sessionId}/history`)).json();
+    const history = data.history || [];
+
+    chatMessages.innerHTML = '';
+    if (history.length === 0) {
+      chatMessages.innerHTML = `
+        <div class="empty-state">
+          <div class="icon">💬</div>
+          <div class="title">空会话</div>
+          <div class="desc">此会话暂无消息</div>
+        </div>
+      `;
+    } else {
+      history.forEach(msg => {
+        addMessage(msg.role, msg.content);
+      });
+    }
+    refreshSessions();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+async function deleteSession(sessionId) {
+  if (!confirm('确定删除此会话？')) return;
+  try {
+    await api(`/api/sessions/${sessionId}`, { method: 'DELETE' });
+    if (state.currentSessionId === sessionId) {
+      state.currentSessionId = null;
+      state.messages = [];
+      chatMessages.innerHTML = `
+        <div class="empty-state">
+          <div class="icon">⚡</div>
+          <div class="title">开始对话</div>
+          <div class="desc">上传文档后，向 AI 提问任何关于文档内容的问题。</div>
+        </div>
+      `;
+    }
+    refreshSessions();
+    toast('会话已删除');
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   File Management
+   ═══════════════════════════════════════════════════════ */
+async function refreshFiles() {
+  try {
+    const [filesData, statsData] = await Promise.all([
+      (await api('/api/files')).json(),
+      (await api('/api/knowledge/stats')).json(),
+    ]);
+
+    const files = filesData.files || [];
+    statFiles.textContent = statsData.files_count || files.length || 0;
+    statChunks.textContent = statsData.total_vectors || 0;
+
+    if (!files.length) {
+      fileList.innerHTML = '<div style="font-size:13px;color:var(--text-muted);padding:8px;">暂无文件</div>';
+    } else {
+      fileList.innerHTML = files.map(f => `
+        <div class="file-item">
+          <span style="font-size:14px;">📄</span>
+          <span class="name" title="${escapeHtml(f)}">${escapeHtml(f)}</span>
+          <button class="del-btn" onclick="deleteFile('${escapeHtml(f)}')" title="删除">×</button>
+        </div>
+      `).join('');
+    }
+  } catch (e) {
+    toast('加载文件失败: ' + e.message, 'error');
+  }
+}
+
+async function uploadFile(file) {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    const res = await fetch('/api/files/upload', { method: 'POST', body: formData });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: '上传失败' }));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    toast(`✅ 已上传「${data.filename}」，新增 ${data.nodes_added} 个片段`, 'success');
+    refreshFiles();
+  } catch (e) {
+    toast(`❌ 上传失败: ${e.message}`, 'error');
+  }
+}
+
+async function deleteFile(filename) {
+  if (!confirm(`确定删除「${filename}」？`)) return;
+  try {
+    await api(`/api/files/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+    toast(`已删除「${filename}」`);
+    refreshFiles();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+async function clearKnowledge() {
+  if (!confirm('确定清空整个知识库？此操作不可撤销！')) return;
+  try {
+    await api('/api/knowledge/clear', { method: 'POST' });
+    toast('知识库已清空');
+    refreshFiles();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   File Upload — Drag & Drop + Click
+   ═══════════════════════════════════════════════════════ */
+uploadZone.addEventListener('click', () => fileInput.click());
+
+uploadZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  uploadZone.classList.add('drag-over');
+});
+
+uploadZone.addEventListener('dragleave', () => {
+  uploadZone.classList.remove('drag-over');
+});
+
+uploadZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  uploadZone.classList.remove('drag-over');
+  const files = Array.from(e.dataTransfer.files);
+  files.forEach(uploadFile);
+});
+
+fileInput.addEventListener('change', () => {
+  const files = Array.from(fileInput.files);
+  files.forEach(uploadFile);
+  fileInput.value = '';
+});
+
+/* ═══════════════════════════════════════════════════════
+   Mobile Sidebar Toggle
+   ═══════════════════════════════════════════════════════ */
+function toggleSidebar() {
+  document.getElementById('kbSidebar').classList.toggle('open');
+}
+
+/* ═══════════════════════════════════════════════════════
+   Init
+   ═══════════════════════════════════════════════════════ */
+async function init() {
+  try {
+    await Promise.all([
+      refreshFiles(),
+      refreshSessions(),
+    ]);
+  } catch (e) {
+    // Server might not be ready yet
+    console.warn('初始化加载部分失败:', e.message);
+  }
+}
+
+// Click outside sidebar to close on mobile
+document.addEventListener('click', (e) => {
+  const sidebar = document.getElementById('kbSidebar');
+  const toggle = document.getElementById('sidebarToggle');
+  if (sidebar.classList.contains('open') && !sidebar.contains(e.target) && e.target !== toggle) {
+    sidebar.classList.remove('open');
+  }
+});
+
+init();
+</script>
+</body>
+</html>
