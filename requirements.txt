@@ -21,6 +21,7 @@ python-multipart>=0.0.20
 
 # 工具
 python-dotenv>=1.0.0
+chardet>=5.2.0     # 文档编码检测（loader.py 使用）
 
 # RAG 评估
 ragas>=0.2.0
@@ -29,3 +30,7 @@ pandas
 
 # 混合检索
 rank-bm25
+
+# 测试
+pytest>=8.0.0
+pytest-asyncio>=0.24.0   # 异步测试支持（test_deepseek_llm.py 需要）

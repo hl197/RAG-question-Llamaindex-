@@ -121,10 +121,25 @@ class KnowledgeIndex:
 
         self._loaded_files = self._load_file_registry()
 
-    # ── 索引构建 ─────────────────────────────────
+    # ── 索引构建（父文档检索：子块检索 → 父块生成） ──
 
     def build_or_update_index(self, documents: List[Document], filename: str) -> int:
-        """增量添加文档到索引。返回新增节点数。"""
+        """
+        增量添加文档到索引（父文档检索模式）。
+
+        流程：
+        1. 按 PARENT_CHUNK_SIZE 切成父块（大块，2048 token）
+        2. 每个父块再按 CHUNK_SIZE 切成子块（小块，512 token）
+        3. 只存子块到 ChromaDB（向量检索粒度），metadata 中保存父块原文
+        4. 检索时：命中子块 → 映射回父块 → 去重后返回给 LLM
+
+        Args:
+            documents: Document 列表
+            filename: 源文件名
+
+        Returns:
+            新增子节点数
+        """
         if self._index is None:
             raise RuntimeError("索引未初始化，请先调用 init_chroma()")
 
@@ -132,22 +147,51 @@ class KnowledgeIndex:
             print(f"⏭️ 文件已存在索引中，跳过: {filename}")
             return 0
 
-        splitter = SentenceSplitter(
+        # 设置文件名元数据
+        for doc in documents:
+            doc.metadata["source_file"] = filename
+
+        # 1. 切父块（大粒度，用于 LLM 上下文）
+        parent_splitter = SentenceSplitter(
+            chunk_size=config.PARENT_CHUNK_SIZE,
+            chunk_overlap=0,
+        )
+        parent_nodes = parent_splitter.get_nodes_from_documents(documents)
+        print(f"  ├─ 父块数: {len(parent_nodes)}（{config.PARENT_CHUNK_SIZE} token/块）")
+
+        # 2. 每个父块再切子块（小粒度，用于向量检索）
+        child_splitter = SentenceSplitter(
             chunk_size=config.CHUNK_SIZE,
             chunk_overlap=config.CHUNK_OVERLAP,
         )
 
-        for doc in documents:
-            doc.metadata["source_file"] = filename
+        all_child_nodes = []
+        parent_texts = []  # 用于统计
 
-        nodes = splitter.get_nodes_from_documents(documents)
-        self._index.insert_nodes(nodes)
+        for pn in parent_nodes:
+            # 把父块文本临时封装为 Document 用于切分
+            parent_doc = Document(
+                text=pn.text,
+                metadata={"source_file": filename},
+            )
+            children = child_splitter.get_nodes_from_documents([parent_doc])
+            for cn in children:
+                # 子块 metadata 中存储父块原文
+                cn.metadata["parent_text"] = pn.text
+                cn.metadata["source_file"] = filename
+            all_child_nodes.extend(children)
+            parent_texts.append(pn.text)
+
+        # 3. 只存子块到 ChromaDB
+        self._index.insert_nodes(all_child_nodes)
 
         self._loaded_files.append(filename)
         self._save_file_registry()
 
-        print(f"✅ 已索引文件: {filename}（{len(nodes)} 个文本块）")
-        return len(nodes)
+        print(f"  ├─ 子块数: {len(all_child_nodes)}（{config.CHUNK_SIZE} token/块）")
+        print(f"  └─ 父/子比例: 1:{max(1, len(all_child_nodes)//max(len(parent_nodes),1))}")
+        print(f"✅ 已索引文件: {filename}")
+        return len(all_child_nodes)
 
     # ── 检索引擎 ─────────────────────────────────
 
@@ -186,13 +230,37 @@ class KnowledgeIndex:
         except Exception:
             return []
 
+    def get_node_parent_mapping(self) -> Dict[str, str]:
+        """
+        返回子块文本 → 父块文本的映射字典。
+
+        用于 _enhanced_retrieve() 中检索到子块后映射回父块，
+        实现"小块检索精度 + 大块上下文完整性"的父文档检索策略。
+
+        Returns:
+            {child_text: parent_text, ...} 空字典表示无映射（旧数据或空索引）
+        """
+        if self._index is None:
+            return {}
+        try:
+            nodes = self._index.docstore.docs.values()
+            mapping = {}
+            for node in nodes:
+                if hasattr(node, "text") and hasattr(node, "metadata"):
+                    parent_text = node.metadata.get("parent_text", "")
+                    if parent_text:
+                        mapping[node.text] = parent_text
+            return mapping
+        except Exception:
+            return {}
+
     # ── 文件管理 ─────────────────────────────────
 
     def remove_file(self, filename: str) -> bool:
         """从 ChromaDB 中删除指定文件名的所有文档片段"""
         try:
             collection = self._get_collection()
-            collection.delete(where={"filename": filename})
+            collection.delete(where={"source_file": filename})
 
             self._loaded_files = self._load_file_registry()
             if filename in self._loaded_files:
@@ -212,17 +280,48 @@ class KnowledgeIndex:
         return list(self._loaded_files)
 
     def clear_knowledge_base(self):
-        """清空知识库（删除所有向量 + 注册表）"""
-        self.close()
+        """清空知识库（保留 ChromaDB 客户端，仅清空集合数据 + 重置注册表）
 
-        if os.path.exists(self._chroma_dir):
-            shutil.rmtree(self._chroma_dir)
-            print("🗑️ 已清空 ChromaDB 数据")
+        注意：不删除 ChromaDB 目录也不重建 PersistentClient，
+        避免新版本 ChromaDB Rust 后端的租户验证 bug。
+        """
+        try:
+            if self._client is not None:
+                collection = self._get_collection()
+                all_records = collection.get()
+                deleted = 0
+                if all_records and all_records.get("ids"):
+                    collection.delete(ids=all_records["ids"])
+                    deleted = len(all_records["ids"])
+                print(f"🗑️ 已清空 ChromaDB 数据（移除了 {deleted} 条向量）")
+        except Exception as e:
+            print(f"⚠️ ChromaDB 集合清空失败: {e}")
 
-        self._vector_store = None
-        self._storage_context = None
-        self._index = None
+        if self._vector_store is not None:
+            # 重建空索引（保留 _client/_vector_store，不销毁）
+            self._storage_context = StorageContext.from_defaults(
+                vector_store=self._vector_store
+            )
+            self._index = VectorStoreIndex.from_vector_store(
+                vector_store=self._vector_store,
+                storage_context=self._storage_context,
+            )
+        else:
+            # 如果向量存储也丢失了，全量重置
+            self.close()
+            if os.path.exists(self._chroma_dir):
+                shutil.rmtree(self._chroma_dir)
+                print("🗑️ 已删除 ChromaDB 目录（全量回退）")
+            self._index = None
+            self._vector_store = None
+            self._storage_context = None
+
         self._loaded_files = []
+
+        # 删除文件注册表
+        if os.path.exists(self._registry_path):
+            os.remove(self._registry_path)
+            print("🗑️ 已删除文件注册表")
 
     def get_collection_stats(self) -> Dict:
         """返回集合统计信息"""
@@ -277,6 +376,10 @@ def get_query_engine(
 
 def get_node_texts() -> List[str]:
     return _get_default().get_node_texts()
+
+
+def get_node_parent_mapping() -> Dict[str, str]:
+    return _get_default().get_node_parent_mapping()
 
 
 def remove_file(filename: str) -> bool:

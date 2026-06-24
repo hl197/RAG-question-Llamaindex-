@@ -146,32 +146,32 @@ async def chat_stream(payload: dict):
     async def event_stream():
         try:
             loop = asyncio.get_event_loop()
-            # 在线程池中运行同步生成器
+            # 在线程池中运行同步生成器（返回 (event_type, data) 元组）
             gen = await loop.run_in_executor(
                 None, lambda: agent.chat_stream(message, session_id)
             )
 
-            previous = ""
-            for cumulative in gen:
-                if cumulative is None:
-                    continue
-                # 计算增量
-                delta = cumulative[len(previous):]
-                previous = cumulative
-                if delta:
-                    yield f"data: {json.dumps({'token': delta}, ensure_ascii=False)}\n\n"
-                    await asyncio.sleep(0)  # 让出控制权
-
-            # 发送结束信号（包含完整回复和会话 ID）
-            final_data = {
-                "done": True,
-                "session_id": agent.get_current_session_id(),
-                "full_text": previous,
-            }
-            yield f"data: {json.dumps(final_data, ensure_ascii=False)}\n\n"
+            final_text = ""
+            for event_type, data in gen:
+                if event_type == "lifecycle":
+                    # Agent 生命周期步骤
+                    yield f"data: {json.dumps({'type': 'lifecycle', 'step': data}, ensure_ascii=False)}\n\n"
+                elif event_type == "token":
+                    # 增量 token（累积文本）
+                    final_text = data
+                    yield f"data: {json.dumps({'type': 'token', 'token': data}, ensure_ascii=False)}\n\n"
+                elif event_type == "done":
+                    # 结束信号
+                    final_data = {
+                        "type": "done",
+                        "session_id": agent.get_current_session_id(),
+                        "full_text": final_text,
+                    }
+                    yield f"data: {json.dumps(final_data, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0)  # 让出控制权
 
         except Exception as e:
-            error_data = {"error": str(e), "done": True}
+            error_data = {"type": "error", "error": str(e), "done": True}
             yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -269,14 +269,12 @@ async def upload_file(file: UploadFile = File(...)):
         else:
             error_msg = result.get("error", "上传失败")
             print(f"❌ 上传失败: {error_msg}")
-            import traceback
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=error_msg)
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ 上传异常: {e}")
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:

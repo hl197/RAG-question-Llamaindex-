@@ -82,10 +82,10 @@ class _LocalEmbeddingWrapper(BaseRagasEmbedding):
 
 
 def _create_judge_llm():
-    """创建 RAGAS judge LLM，指向 DeepSeek API（instructor Mode.JSON）"""
+    """创建 RAGAS judge LLM，使用项目统一配置（API Key、Base URL、代理等）"""
     client = OpenAI(
-        api_key=os.getenv("DEEPSEEK_API_KEY", ""),
-        base_url="https://api.deepseek.com",
+        api_key=config.DEEPSEEK_API_KEY,
+        base_url=config.DEEPSEEK_BASE_URL,
     )
     return llm_factory(config.LLM_MODEL, client=client)
 

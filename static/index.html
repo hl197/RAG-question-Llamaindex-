@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>RAG 智能问答助手</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230ea5e9'/><text x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif'>R</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600&family=Playfair+Display:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
@@ -689,6 +690,78 @@ body::after {
 .empty-state .title { font-size: 17px; color: var(--text-secondary); font-family: var(--font-display); }
 .empty-state .desc { font-size: 13px; max-width: 360px; line-height: 1.7; }
 
+/* Upload Progress */
+.upload-progress {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  background: rgba(255,255,255,0.3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+[data-theme="dark"] .upload-progress {
+  background: rgba(255,255,255,0.03);
+}
+
+.upload-progress .progress-track {
+  height: 6px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.upload-progress .progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-strong));
+  border-radius: 4px;
+  transition: width 150ms ease;
+}
+
+/* 上传完成 → 服务器处理中：脉冲动画 */
+.upload-progress .progress-fill.processing {
+  background: linear-gradient(90deg, var(--accent), var(--accent-strong), var(--accent));
+  background-size: 200% 100%;
+  animation: progressPulse 1s ease infinite;
+  width: 100% !important;
+}
+
+.upload-progress .progress-fill.done {
+  background: linear-gradient(90deg, #22c55e, #16a34a);
+}
+
+@keyframes progressPulse {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+.upload-progress .progress-text {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  text-align: center;
+}
+
+/* ── Lifecycle Status Lines ── */
+.lifecycle-step {
+  margin: 1px 0;
+  animation: msgIn 300ms ease both;
+  align-self: flex-start;
+  max-width: 90%;
+}
+
+.lifecycle-step .lifecycle-status {
+  display: inline-block;
+  padding: 3px 12px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ═══════════════════════════════════════════════════════
    Toast / Notification
    ═══════════════════════════════════════════════════════ */
@@ -780,6 +853,14 @@ body::after {
         <div class="hint">支持 PDF · DOCX · PPTX · TXT · MD · CSV</div>
       </div>
       <input type="file" id="fileInput" hidden multiple accept=".pdf,.docx,.pptx,.txt,.md,.csv">
+
+      <!-- Upload Progress Bar -->
+      <div class="upload-progress" id="uploadProgress" style="display:none;">
+        <div class="progress-track">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <span class="progress-text" id="progressText">上传中…</span>
+      </div>
 
       <!-- Stats -->
       <div class="stats-card" id="statsCard">
@@ -915,6 +996,9 @@ const toastContainer = $('#toastContainer');
 const sessionCount = $('#sessionCount');
 const statFiles = $('#statFiles');
 const statChunks = $('#statChunks');
+const progressFill = $('#progressFill');
+const progressText = $('#progressText');
+const uploadProgress = $('#uploadProgress');
 
 /* ═══════════════════════════════════════════════════════
    Toast
@@ -980,6 +1064,13 @@ async function sendMessage() {
   statusText.textContent = '思考中…';
 
   let fullText = '';
+  let streamTimedOut = false;
+  const STREAM_TIMEOUT = 120000; // 120 秒超时
+  const streamTimeoutId = setTimeout(() => {
+    streamTimedOut = true;
+    fullText = '⚠️ 请求超时（120 秒），请重试或检查服务器状态';
+    toast('请求超时，请重试', 'error');
+  }, STREAM_TIMEOUT);
 
   try {
     const res = await fetch('/api/chat/stream', {
@@ -998,6 +1089,10 @@ async function sendMessage() {
     let buffer = '';
 
     while (true) {
+      if (streamTimedOut) {
+        reader.cancel();
+        break;
+      }
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -1009,26 +1104,30 @@ async function sendMessage() {
         if (line.startsWith('data: ')) {
           try {
             const data = JSON.parse(line.slice(6));
-            if (data.error) {
-              fullText = `⚠️ ${data.error}`;
-            } else if (data.done) {
+            if (data.type === 'error' || data.error) {
+              fullText = `⚠️ ${data.error || ''}`;
+            } else if (data.type === 'done' || data.done) {
               state.currentSessionId = data.session_id;
               if (data.full_text && data.full_text.length > fullText.length) {
                 fullText = data.full_text;
               }
               refreshSessions();
-            } else if (data.token) {
-              fullText += data.token;
-              bubble.innerHTML = renderMarkdown(fullText);
-              chatMessages.scrollTop = chatMessages.scrollHeight;
+              const indicator = bubble?.querySelector('.typing-indicator');
+              if (indicator) indicator.remove();
+            } else if (data.type === 'lifecycle' && data.step) {
+              statusText.textContent = '分析中…';
+              addLifecycleStep(data.step, assistantMsg);
+            } else if (data.type === 'token' || data.token) {
+              fullText = data.token;
+              if (bubble) {
+                bubble.innerHTML = renderMarkdown(fullText);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+              }
             }
           } catch (e) { /* ignore parse errors */ }
         }
       }
     }
-
-    const indicator = bubble.querySelector('.typing-indicator');
-    if (indicator) indicator.remove();
 
     if (!fullText) fullText = '（未收到回复）';
   } catch (e) {
@@ -1036,10 +1135,13 @@ async function sendMessage() {
     toast(e.message, 'error');
   }
 
-  bubble.innerHTML = renderMarkdown(fullText);
+  if (bubble) {
+    bubble.innerHTML = renderMarkdown(fullText);
+  }
   assistantMsg.classList.add('done');
   chatMessages.scrollTop = chatMessages.scrollHeight;
 
+  clearTimeout(streamTimeoutId);
   state.isStreaming = false;
   sendBtn.disabled = false;
   statusText.textContent = '就绪';
@@ -1068,6 +1170,24 @@ function addMessage(role, content, isStreaming = false) {
   chatMessages.appendChild(div);
   chatMessages.scrollTop = chatMessages.scrollHeight;
   return div;
+}
+
+/* ── Lifecycle Status Line Rendering ── */
+function addLifecycleStep(step, beforeEl) {
+  const { status } = step;
+  if (!status) return;
+
+  const div = document.createElement('div');
+  div.className = 'lifecycle-step';
+  div.innerHTML = `<span class="lifecycle-status">${escapeHtml(status)}</span>`;
+
+  // 插入到助手气泡之前（步骤显示在答案上方）
+  if (beforeEl && beforeEl.parentNode) {
+    chatMessages.insertBefore(div, beforeEl);
+  } else {
+    chatMessages.appendChild(div);
+  }
+  chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
 function renderMarkdown(text) {
@@ -1121,7 +1241,7 @@ async function refreshSessions() {
     sessionList.innerHTML = sessions.map(s => {
       const isActive = s.session_id === state.currentSessionId;
       const name = s.session_name || '未命名会话';
-      const time = s.updated_at ? new Date(s.updated_at).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' }) : '';
+      const time = s.last_active ? new Date(s.last_active).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' }) : '';
       return `
         <div class="session-item ${isActive ? 'active' : ''}" onclick="switchSession('${s.session_id}')">
           <span class="title">${escapeHtml(name)}</span>
@@ -1234,22 +1354,67 @@ async function refreshFiles() {
   }
 }
 
-async function uploadFile(file) {
+function uploadFile(file) {
+  // 显示进度条
+  const fileName = file.name;
+  uploadProgress.style.display = 'block';
+  progressFill.style.width = '0%';
+  progressText.textContent = `📤 ${fileName} — 上传中 (0%)`;
+
   const formData = new FormData();
   formData.append('file', file);
 
-  try {
-    const res = await fetch('/api/files/upload', { method: 'POST', body: formData });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: '上传失败' }));
-      throw new Error(err.detail || `HTTP ${res.status}`);
+  const xhr = new XMLHttpRequest();
+
+  xhr.upload.addEventListener('progress', (e) => {
+    if (e.lengthComputable) {
+      const pct = Math.round((e.loaded / e.total) * 100);
+      progressFill.style.width = pct + '%';
+      if (pct < 100) {
+        progressText.textContent = `📤 ${fileName} — ${pct}%`;
+      } else {
+        // 上传完成，服务器正在处理（解析→切块→向量化→建索引）
+        progressText.textContent = `⏳ ${fileName} — 服务器处理中 (解析/向量化/建索引)...`;
+        progressFill.classList.add('processing');
+      }
     }
-    const data = await res.json();
-    toast(`✅ 已上传「${data.filename}」，新增 ${data.nodes_added} 个片段`, 'success');
-    refreshFiles();
-  } catch (e) {
-    toast(`❌ 上传失败: ${e.message}`, 'error');
-  }
+  });
+
+  xhr.addEventListener('load', () => {
+    if (xhr.status >= 200 && xhr.status < 300) {
+      try {
+        const data = JSON.parse(xhr.responseText);
+        progressText.textContent = `✅ ${fileName} 完成，新增 ${data.nodes_added} 个片段`;
+        progressFill.classList.remove('processing');
+        progressFill.classList.add('done');
+        setTimeout(() => { uploadProgress.style.display = 'none'; }, 2000);
+        toast(`✅ 已上传「${data.filename}」，新增 ${data.nodes_added} 个片段`, 'success');
+        refreshFiles();
+      } catch (e) {
+        progressText.textContent = `❌ ${fileName} 解析响应失败`;
+        setTimeout(() => { uploadProgress.style.display = 'none'; }, 2000);
+        toast('上传响应解析失败', 'error');
+      }
+    } else {
+      let errMsg = '上传失败';
+      try {
+        const err = JSON.parse(xhr.responseText);
+        errMsg = err.detail || errMsg;
+      } catch (_) {}
+      progressText.textContent = `❌ ${fileName} — ${errMsg}`;
+      setTimeout(() => { uploadProgress.style.display = 'none'; }, 3000);
+      toast(`❌ 上传失败: ${errMsg}`, 'error');
+    }
+  });
+
+  xhr.addEventListener('error', () => {
+    progressText.textContent = `❌ ${fileName} — 网络错误`;
+    setTimeout(() => { uploadProgress.style.display = 'none'; }, 3000);
+    toast('上传网络错误，请检查服务器', 'error');
+  });
+
+  xhr.open('POST', '/api/files/upload');
+  xhr.send(formData);
 }
 
 async function deleteFile(filename) {

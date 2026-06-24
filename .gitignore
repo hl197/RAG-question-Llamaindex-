@@ -17,6 +17,9 @@ evaluation/eval_report.json
 .vscode/
 .idea/
 
+# node_modules（脚本依赖）
+scripts/node_modules/
+
 # 系统
 Thumbs.db
 .DS_Store

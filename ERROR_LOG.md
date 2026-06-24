@@ -362,3 +362,39 @@ ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
 - `knowledge/indexer.py` — `_init_embedding()` 不再硬编码 LocalEmbedding
 - `static/index.html` — marked.js 改为本地引用
 - `config.py` — 新增 `LLM_MAX_TOKENS=8192`、`LLM_CONTEXT_WINDOW`、`EMBED_TYPE` 等配置项
+
+---
+
+## 19. 模块级函数缺失：get_node_parent_mapping
+
+**错误**: Agent 调用 knowledge_base 工具时报错 `module 'knowledge.indexer' has no attribute 'get_node_parent_mapping'`
+
+**根因**: 添加父文档检索功能时，只在 `KnowledgeIndex` 类上加了 `get_node_parent_mapping()` 方法。但 `rag_agent.py` 通过 `from knowledge import indexer` 导入模块级函数，`indexer.get_node_parent_mapping()` 找不到——缺少对应的模块级包装器。
+
+**解决过程**: 在 `indexer.py` 的模块级函数区添加：
+```python
+def get_node_parent_mapping() -> Dict[str, str]:
+    return _get_default().get_node_parent_mapping()
+```
+
+**关键文件**: `knowledge/indexer.py`
+
+---
+
+## 20. 清空知识库 500 错误：ChromaDB Rust 后端租户验证失败
+
+**错误**: `POST /api/knowledge/clear` 返回 500，log 为：
+```
+ValueError: Could not connect to tenant default_tenant. Are you sure it exists?
+```
+深层还有：`AttributeError: 'RustBindingsAPI' object has no attribute 'bindings'`
+
+**根因**: `clear_knowledge_base()` 执行 `close()` 停止 ChromaDB 客户端 → `rmtree` 删除目录 → `init_chroma()` 重新创建 `PersistentClient`。新版本 ChromaDB（Rust 后端）在空目录上创建客户端时，`_validate_tenant_database` → `self.bindings.get_tenant(name)` 失败，Rust bindings 未正确初始化。
+
+**解决过程**: 重写 `clear_knowledge_base()`，不再销毁/重建 ChromaDB 客户端：
+1. 从集合 `get()` 所有记录 ID → `delete(ids=...)` 清空数据
+2. 通过 `VectorStoreIndex.from_vector_store()` 在内存重建空索引
+3. 删除文件注册表
+4. 保留 `_vector_store` 回退逻辑（`None` 时全量重置）
+
+**关键文件**: `knowledge/indexer.py`

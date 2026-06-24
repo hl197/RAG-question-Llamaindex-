@@ -6,17 +6,24 @@ RAG Agent 封装
 
 import os
 import re
+import threading
 from typing import List, Optional, Dict
 
 from llama_index.core import Settings, Document
 from llama_index.core.agent import AgentRunner
 from llama_index.core.agent.react import ReActAgentWorker
 from llama_index.core.agent.react.formatter import ReActChatFormatter
+from llama_index.core.agent.react.types import (
+    ActionReasoningStep,
+    ObservationReasoningStep,
+    ResponseReasoningStep,
+)
 from llama_index.core.tools import QueryEngineTool, FunctionTool
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
 from knowledge.local_embedding import LocalEmbedding
 from knowledge.query_decomposer import QueryDecomposer
+from knowledge.query_rewriter import QueryRewriter
 from knowledge.hybrid_retriever import HybridRetriever
 from knowledge.reranker import Reranker
 from agent.llm_adapter import create_llm
@@ -26,7 +33,7 @@ from knowledge import loader, indexer
 from agent.memory import PersistentChatMemory
 
 
-# 针对 DeepSeek 优化的 ReAct 系统提示模板
+# 针对 DeepSeek 优化的 ReAct 系统提示模板（中文版，更严格）
 _DEEPSEEK_REACT_SYSTEM_HEADER = """\
 You are a helpful AI assistant designed to answer questions using the tools available to you.
 
@@ -37,29 +44,35 @@ You have access to the following tools:
 
 ## Output Format — STRICTLY REQUIRED
 
-You MUST follow the format below. THIS IS MANDATORY.
+You MUST output in EXACTLY one of the two formats below. NO OTHER FORMAT IS ACCEPTABLE.
 
-### When you need to use a tool — start with "Thought:":
+### Format 1 — When you need to search the knowledge base:
 
-Thought: <your reasoning in the user's language>
-Action: <tool name — one of {tool_names}>
-Action Input: <JSON kwargs, e.g. {{"input": "query text"}}>
+Thought: <your reasoning in Chinese>
+Action: {tool_names}
+Action Input: <JSON with "input" or "query" key>
 
-### When you can answer directly — start with "Thought:":
+✅ CORRECT example (must use tool name exactly as given):
+Thought: 用户问的是张三的项目经验，我需要检索知识库
+Action: knowledge_base
+Action Input: {{"query": "张三 项目经验"}}
 
-Thought: <your reasoning in the user's language>
-Answer: <your final answer>
+### Format 2 — When you can answer directly:
 
-### CRITICAL RULES (violation will break the system):
-1. Your response MUST start with "Thought:" as the FIRST word.
-2. After you get an "Observation:" back from a tool, continue with another "Thought:" step.
-3. When you have enough information, end with:
-   Thought: ...
-   Answer: <final answer>
+Thought: <your reasoning in Chinese>
+Answer: <your final answer in Chinese>
 
-## Current Conversation
+✅ CORRECT example:
+Thought: 用户只是问好，不需要检索
+Answer: 你好！有什么可以帮助你的？
 
-Below is the current conversation consisting of interleaving human and assistant messages.
+### CRITICAL RULES (violation WILL break the system):
+1. Your response MUST start with "Thought:" as the FIRST word — nothing before it.
+2. After "Action:" put ONLY the tool name — no extra words, no colons, no quotes.
+3. After "Action Input:" put ONLY valid JSON.
+4. After getting "Observation:" back, continue with another "Thought:" step.
+5. When you have enough information, end with "Thought:" + "Answer:".
+6. NEVER explain the format — just output it.
 """
 
 
@@ -81,6 +94,42 @@ def _strip_react_trace(text: str) -> str:
     # 3) 去掉孤立 "Thought:" 前缀
     text = re.sub(r'^Thought:\s*', '', text).strip()
     return text
+
+
+# 生命周期步骤提取：将 LlamaIndex 的推理步骤转为前端状态文本
+def _extract_lifecycle_step(step, user_message: str = "") -> dict | None:
+    """从 Agent 推理步骤中提取生命周期信息，返回简化的 status 文本。
+
+    返回格式：{"type": "action|observation|response", "status": "状态描述"}
+    或者 None（应跳过此步骤，例如用户自己的输入）。
+    """
+    if isinstance(step, ActionReasoningStep):
+        # 截断过长的思考内容
+        thought = step.thought
+        if len(thought) > 120:
+            thought = thought[:120] + "…"
+        return {
+            "type": "action",
+            "status": f"🤔 {thought} → 🔧 {step.action}",
+        }
+    if isinstance(step, ObservationReasoningStep):
+        # 跳过用户自己消息的回显（由 add_user_step_to_reasoning 注入）
+        if step.observation == user_message:
+            return None
+        # 提取工具返回的简要信息（第一行或文件匹配数等）
+        obs = step.observation[:200].replace("\n", " ").strip()
+        if len(step.observation) > 200:
+            obs += "…"
+        return {
+            "type": "observation",
+            "status": f"📥 {obs}",
+        }
+    if isinstance(step, ResponseReasoningStep):
+        return {
+            "type": "response",
+            "status": "💡 正在生成回答…",
+        }
+    return None
 
 
 class FixedReActAgentWorker(ReActAgentWorker):
@@ -138,6 +187,9 @@ class RAGAgent:
         # ── 记忆 ──
         self.memory = PersistentChatMemory()
         self.current_session_id: Optional[str] = None
+
+        # ── 并发锁（保护所有修改共享状态的方法） ──
+        self._lock = threading.Lock()
 
         # ── Token 用量跟踪 ──
         self._session_token_usage: Dict[str, Dict[str, int]] = {}
@@ -232,18 +284,34 @@ class RAGAgent:
 
     def _enhanced_retrieve(self, query: str) -> str:
         """
-        增强版检索（Agent 工具调用入口）。
+        增强版检索管线（Agent 工具调用入口）。
 
-        管线: 查询分解 → 混合检索 → 重排序 → 格式化返回
+        完整管线（按执行顺序）：
+        1. 查询改写     → LLM 将口语化问题转为检索友好语句  [ENABLE_QUERY_REWRITING]
+        2. 查询分解     → 复杂问题拆为 2-3 个子查询          [ENABLE_QUERY_DECOMPOSITION]
+        3. 混合检索     → 每个子查询分别执行向量+BM25检索     [ENABLE_HYBRID_RETRIEVAL]
+        4. 父文档映射   → 命中的子块 → 映射回所属父块去重   [ENABLE_PARENT_RETRIEVAL]
+        5. 重排序       → 关键词+LLM 两阶段精排              [ENABLE_RERANKING]
+        6. 格式化返回   → 返回 top-K 片段给 Agent
         """
-        # Step 1: 查询分解
+        # ── Step 1: 查询改写 ──
+        if config.ENABLE_QUERY_REWRITING:
+            rewriter = QueryRewriter(self.llm)
+            rewritten_query = rewriter.rewrite(query)
+            if rewritten_query != query:
+                print(f"  🔄 查询改写: 「{query}」→「{rewritten_query}」")
+            search_query = rewritten_query
+        else:
+            search_query = query
+
+        # ── Step 2: 查询分解 ──
         if config.ENABLE_QUERY_DECOMPOSITION:
             decomposer = QueryDecomposer(self.llm)
-            sub_queries = decomposer.decompose(query)
+            sub_queries = decomposer.decompose(search_query)
         else:
-            sub_queries = [query]
+            sub_queries = [search_query]
 
-        # Step 2: 对每个子查询执行检索
+        # ── Step 3: 对每个子查询执行检索 ──
         all_results = {}  # text → max_score
         node_texts = indexer.get_node_texts()
 
@@ -273,15 +341,25 @@ class RAGAgent:
                     text = node.text
                     all_results[text] = max(all_results.get(text, 0), node.score or 0)
 
-        # Step 3: 重排序
-        if config.ENABLE_RERANKING and len(all_results) > config.SIMILARITY_TOP_K:
+        # ── Step 4: 父文档映射（子块→父块去重） ──
+        if config.ENABLE_PARENT_RETRIEVAL:
+            parent_mapping = indexer.get_node_parent_mapping()
+            if parent_mapping:
+                parent_agg = {}
+                for child_text, score in all_results.items():
+                    parent_text = parent_mapping.get(child_text, child_text)
+                    parent_agg[parent_text] = max(parent_agg.get(parent_text, 0), score)
+                all_results = parent_agg
+
+        # ── Step 5: 重排序（去掉条件限制，始终执行排序） ──
+        if config.ENABLE_RERANKING and len(all_results) > 1:
             candidates = sorted(all_results, key=all_results.get, reverse=True)
             reranker = Reranker(self.llm)
             reranked = reranker.rerank(query, candidates, top_k=config.SIMILARITY_TOP_K)
         else:
             reranked = sorted(all_results, key=all_results.get, reverse=True)[:config.SIMILARITY_TOP_K]
 
-        # Step 4: 格式化返回
+        # ── Step 6: 格式化返回 ──
         if not reranked:
             return "知识库中未找到相关信息。"
 
@@ -323,6 +401,11 @@ class RAGAgent:
         Returns:
             str: Agent 回复
         """
+        with self._lock:
+            return self._chat_impl(message, session_id)
+
+    def _chat_impl(self, message: str, session_id: Optional[str] = None) -> str:
+        """chat() 的实际实现（被锁包裹）"""
         # 确保有会话
         if session_id is None:
             session_id = self.memory.create_session()
@@ -371,10 +454,9 @@ class RAGAgent:
                 print(f"{'='*50}\n")
 
                 if attempt == 0:
-                    # 不清除工具，只重置 memory 和 buffer
+                    # 重置并重新加载历史上下文（避免重试后"失忆"）
                     print("🔄 重置记忆并重试...")
-                    self._agent.reset()
-                    self._init_session_memory(session_id)
+                    self._load_session_to_agent(session_id)
                 else:
                     # 第二次仍失败，给用户显示详细错误
                     reply = f"抱歉，处理时出错: {type(e).__name__}: {e}"
@@ -391,13 +473,20 @@ class RAGAgent:
 
     def chat_stream(self, message: str, session_id: Optional[str] = None):
         """
-        流式对话生成器。逐块 yield 累积回复文本，前端可实时渲染。
+        流式对话生成器（升级版）。
 
-        应对两种场景：
-        1) LLM 输出了 "Answer:" 标记 → response_gen 自然流式，逐 chunk yield
-        2) 未输出 "Answer:"（伪流式） → 收集后手动拆分为渐进块再 yield
+        流程：
+          1. 会话管理与记忆加载（同前）
+          2. 手动驱动 Agent 逐步推理，每次 yield ("lifecycle", step_data) 展示生命周期
+          3. 推理完成后以模拟流式 yield ("token", 累积文本)
+          4. 最后 yield ("done", session_id)
+
+        Yields:
+            ("lifecycle", dict) — Agent 推理步骤（思考/工具/观察/回答）
+            ("token", str)     — 最终回答增量文本
+            ("done", session_id) — 结束信号
         """
-        # 会话管理（同 chat()）
+        # ── 会话管理（同 chat()） ──
         if session_id is None:
             session_id = self.memory.create_session()
         self.current_session_id = session_id
@@ -420,64 +509,17 @@ class RAGAgent:
         # 记录 Agent 处理前的 token 用量
         usage_before = self.llm.get_token_usage()
 
-        # Agent 流式处理（带自动重试）
         import traceback
 
+        full_text = ""
         for attempt in range(2):
             try:
-                stream_response = self._agent.stream_chat(message)
-                gen = stream_response.response_gen
-
-                # ── peek 前 2 个 chunk，判断是真流式还是伪流式 ──
-                first: str = ""
-                second: str = ""
-                try:
-                    d = next(gen)
-                    if d:
-                        first = d
-                except StopIteration:
-                    pass
-
-                try:
-                    d = next(gen)
-                    if d:
-                        second = d
-                except StopIteration:
-                    pass
-
-                # 拼起来
-                full_response = first + second
-
-                # 收集到的实际 chunk 数
-                real_chunks = (1 if first else 0) + (1 if second else 0)
-
-                if real_chunks <= 2 and full_response and len(full_response) > 30:
-                    # ── 伪流式: response_gen 只吐了 1-2 个 chunk（一次全量）──
-                    # 手动拆分为渐进块并逐步 yield
-                    step = max(3, len(full_response) // 40)
-                    text_so_far = ""
-                    for i in range(0, len(full_response), step):
-                        text_so_far = full_response[:i + step]
-                        yield text_so_far
-                    full_response = text_so_far
-                else:
-                    # ── 真流式: 继续消费剩余 chunk，逐步 yield ──
-                    # 用 accumulated 保证每次 yield 都是累积文本，server.py 依赖此特性计算增量
-                    accumulated = ""
-                    if first:
-                        accumulated = first
-                        yield accumulated
-                    if second:
-                        accumulated += second
-                        yield accumulated
-                    # 继续消费剩余的 gen
-                    for delta in gen:
-                        if delta:
-                            accumulated += delta
-                            yield accumulated
-                    full_response = accumulated
-
-                break  # 成功，跳出重试循环
+                # 手动逐步骤驱动 Agent，产出生命周期事件 + token + done
+                for evt_type, evt_data in self._run_steps(message):
+                    if evt_type == "token":
+                        full_text = evt_data
+                    yield (evt_type, evt_data)
+                break  # 成功
 
             except Exception as e:
                 error_detail = traceback.format_exc()
@@ -489,19 +531,62 @@ class RAGAgent:
 
                 if attempt == 0:
                     print("🔄 重置记忆并重试...")
-                    self._agent.reset()
-                    self._init_session_memory(session_id)
+                    self._load_session_to_agent(session_id)
                 else:
-                    yield f"抱歉，处理时出错: {type(e).__name__}: {e}"
-                    full_response = ""
+                    yield ("token", f"抱歉，处理时出错: {type(e).__name__}: {e}")
+                    yield ("done", self.current_session_id or session_id)
+                    full_text = ""
+                    break
 
         # 跟踪 token 用量
         usage_after = self.llm.get_token_usage()
         self._track_session_usage(session_id, usage_before, usage_after)
 
         # 保存助手回复（后置清理 ReAct 追踪文本）
-        cleaned = _strip_react_trace(full_response)
-        self.memory.save_message(session_id, "assistant", cleaned or full_response)
+        cleaned = _strip_react_trace(full_text)
+        self.memory.save_message(session_id, "assistant", cleaned or full_text)
+
+    # ── 手动步骤执行（供 chat_stream 内部使用） ────────────
+
+    def _run_steps(self, message: str):
+        """以手动逐步骤方式驱动 Agent，产出 (event_type, data) 事件。
+
+        Yields:
+            ("lifecycle", dict) — 推理步骤
+            ("token", str)      — 最终回答累积文本
+            ("done", session_id) — 结束
+        """
+        task = self._agent.create_task(message)
+        is_last = False
+        emitted_count = 0  # 已发出的 reasoning steps 数量
+
+        while not is_last:
+            step_output = self._agent.run_step(task.task_id)
+            is_last = step_output.is_last
+
+            # 获取当前所有推理步骤
+            current_task = self._agent.state.get_task(task.task_id)
+            reasoning = current_task.extra_state["current_reasoning"]
+
+            # 发出新增的步骤
+            for i in range(emitted_count, len(reasoning)):
+                rs = reasoning[i]
+                info = _extract_lifecycle_step(rs, message)
+                if info is not None:
+                    yield ("lifecycle", info)
+            emitted_count = len(reasoning)
+
+        # 获取最终回答
+        response = self._agent.finalize_response(task.task_id)
+        full_text = str(response)
+
+        # 模拟流式输出最终答案
+        if full_text:
+            chunk_size = max(3, len(full_text) // 40)
+            for i in range(0, len(full_text), chunk_size):
+                yield ("token", full_text[:i + chunk_size])
+
+        yield ("done", self.current_session_id)
 
     def _init_session_memory(self, session_id: str):
         """初始化新会话的记忆"""
@@ -509,15 +594,18 @@ class RAGAgent:
         system_msg = ChatMessage(
             role=MessageRole.SYSTEM,
             content=(
-                "你是一个智能文档问答助手。你的核心职责是基于知识库中的文档回答用户问题。\n\n"
-                "【必须遵守的规则】\n"
-                "1. 当用户询问知识库中的具体信息或文档内容时，**必须**使用 knowledge_base 工具\n"
-                "   检索知识库，不得依赖自身知识回答。\n"
-                "2. 当用户问「知识库里有什么」、「总结一下文档」等全局性问题时，使用\n"
-                "   knowledge_summary 工具获取文件列表和统计信息。\n"
-                "3. 每次回答前先判断是否需要检索知识库，需要时先用工具再回答。\n"
-                "4. 检索后如果知识库中确实没有相关信息，如实告知用户。\n"
-                "5. 闲聊或问候可以直接回应，不需要使用工具。"
+                "你是一个**严格基于知识库**的文档问答助手。\n\n"
+                "【最高优先级规则——必须遵守】\n"
+                "1. 🔍 **所有知识类问题都必须先检索知识库**\n"
+                "   无论用户问什么（概念解释、事实查询、总结归纳），\n"
+                "   只要不是打招呼/闲聊，都必须先用 knowledge_base 工具检索知识库。\n"
+                "   即使你觉得自己知道答案，也必须先查知识库确认。\n\n"
+                "2. 当用户问「知识库里有什么」、「总结一下文档」等全局性问题时，\n"
+                "   使用 knowledge_summary 工具获取文件列表和统计信息。\n\n"
+                "3. 检索后如果知识库中确实没有相关信息，如实告知用户，\n"
+                "   不要用你自己的知识编造答案。\n\n"
+                "4. 打招呼/闲聊可以直接回应，不需要使用工具。\n"
+                "   （如「你好」、「再见」、「谢谢」）"
             ),
         )
         self._agent.memory.put(system_msg)
@@ -566,6 +654,11 @@ class RAGAgent:
 
     def new_session(self) -> str:
         """开启新会话"""
+        with self._lock:
+            return self._new_session_impl()
+
+    def _new_session_impl(self) -> str:
+        """new_session 实际实现（被锁包裹）"""
         self._agent.reset()
         session_id = self.memory.create_session()
         self.current_session_id = session_id
@@ -579,6 +672,11 @@ class RAGAgent:
         Returns:
             bool: 切换是否成功
         """
+        with self._lock:
+            return self._switch_session_impl(session_id)
+
+    def _switch_session_impl(self, session_id: str) -> bool:
+        """switch_session 实际实现（被锁包裹）"""
         if not self.memory.session_exists(session_id):
             return False
 
@@ -662,13 +760,14 @@ class RAGAgent:
 
     def clear_knowledge(self):
         """清空知识库（谨慎使用）"""
-        indexer.clear_knowledge_base()
-        # 重新初始化
-        indexer.init_chroma()
-        self._tools = self._build_tools()
-        self._agent = self._create_agent()
-        if self.current_session_id:
-            self._init_session_memory(self.current_session_id)
+        with self._lock:
+            indexer.clear_knowledge_base()
+            # 重新初始化
+            indexer.init_chroma()
+            self._tools = self._build_tools()
+            self._agent = self._create_agent()
+            if self.current_session_id:
+                self._init_session_memory(self.current_session_id)
 
     # ── 资源管理 ──────────────────────────────────
 

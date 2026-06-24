@@ -61,7 +61,7 @@ class TestLLMConfig:
         config = LLMConfig()
         assert config.model == "deepseek-chat"
         assert config.temperature == 0.7
-        assert config.max_tokens == 4096
+        assert config.max_tokens == 8192
         assert config.context_window == 65536
 
     # ── 边界条件 ──────────────────────────────────

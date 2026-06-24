@@ -61,6 +61,12 @@ _try_enc = _try_decrypt_key()
 DEEPSEEK_API_KEY = _try_env or _try_enc or ""
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
+# 启动时检测 API Key 是否为空
+if not DEEPSEEK_API_KEY:
+    print("⚠️  WARNING: DEEPSEEK_API_KEY 未设置！")
+    print("   请在环境变量或 .env 文件中配置 DeepSeek API Key。")
+    print("   首次调用 API 时将失败。")
+
 # ===== 模型配置 =====
 LLM_MODEL = "deepseek-chat"
 LLM_MAX_TOKENS = 8192  # 单次回答最大 token 数
@@ -72,17 +78,20 @@ EMBED_DIM = 256  # 仅 LocalEmbedding 使用（SemanticEmbedding 由模型决定
 # 注意：修改此值后需清空 data/chroma/ 重新建索引，否则维度不匹配
 
 # ===== 分块参数 =====
-CHUNK_SIZE = 512
-CHUNK_OVERLAP = 128
+CHUNK_SIZE = 512          # 子块大小（向量检索粒度；精度优先）
+CHUNK_OVERLAP = 128       # 子块重叠
+PARENT_CHUNK_SIZE = 2048  # 父块大小（LLM 上下文粒度；完整性优先）
 
 # ===== 检索参数 =====
 SIMILARITY_TOP_K = 8
 SIMILARITY_CUTOFF = 0.3  # 相似度阈值，过滤低分噪音片段
 
 # ===== Phase 3: 检索增强开关 =====
+ENABLE_QUERY_REWRITING = True    # 查询改写（LLM优化检索语句）
 ENABLE_QUERY_DECOMPOSITION = True  # 复杂查询自动分解为子查询
 ENABLE_HYBRID_RETRIEVAL = True     # 向量 + BM25 混合检索
 ENABLE_RERANKING = True            # 检索后 LLM 精排
+ENABLE_PARENT_RETRIEVAL = True     # 父文档检索（小块检索→大块生成）
 
 # ===== 数据目录 =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -136,6 +145,4 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 # ===== 服务器配置 =====
-SERVER_PORT = 7860  # HTTP 服务端口（FastAPI / Gradio 通用）
-GRADIO_SERVER_PORT = SERVER_PORT  # 向后兼容（旧 app.py 仍可用）
-GRADIO_SHARE = False  # 设为 True 可生成外网链接（仅 Gradio）
+SERVER_PORT = 7860  # HTTP 服务端口

@@ -26,13 +26,10 @@ class Reranker:
 
     def _keyword_score(self, query: str, text: str) -> float:
         """基于关键词重叠的快速评分"""
-        # 提取查询中的关键词（2字及以上）
-        query_words = set()
-        for i in range(len(query)):
-            for j in range(i + 2, min(i + 5, len(query) + 1)):
-                w = query[i:j]
-                if w.strip() and len(w.strip()) >= 2:
-                    query_words.add(w.strip())
+        import re
+        # 按标点和空格分词，保留 ≥2 字的词作为关键词
+        tokens = re.split(r'[\s，。！？、；：""''（）()\n,.!?;:]+', query)
+        query_words = {t.strip() for t in tokens if len(t.strip()) >= 2}
 
         if not query_words:
             return 0.0
@@ -92,16 +89,14 @@ class Reranker:
             use_llm: 是否使用 LLM 打分（关闭则仅用关键词）
 
         Returns:
-            排序后的文本列表
+            排序后的文本列表（即使 candidates 数量 ≤ top_k 也会排序后返回）
         """
-        if len(candidates) <= top_k:
-            return candidates
 
         # 1. 关键词快速评分
         kw_scores = [self._keyword_score(query, t) for t in candidates]
 
         # 2. LLM 精排
-        if use_llm and self._llm:
+        if use_llm and self._llm and len(candidates) > 1:
             llm_scores = self._llm_score(query, candidates)
         else:
             llm_scores = kw_scores
@@ -112,7 +107,7 @@ class Reranker:
             for kw, llm in zip(kw_scores, llm_scores)
         ]
 
-        # 4. 排序取 top_k
+        # 4. 排序取 top_k（即使候选少也重新排序）
         ranked = sorted(
             enumerate(final_scores),
             key=lambda x: x[1],
