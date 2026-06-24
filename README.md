@@ -52,7 +52,8 @@ RAG-question/
 ├── agent/                 # Agent 核心层（ReAct 推理 + LLM + 记忆）
 ├── knowledge/             # 知识层（文档解析 + 向量索引 + 检索管线）
 ├── evaluation/            # RAGAS 质量评估
-├── static/index.html      # 前端 SPA
+├── static/                # 前端 SPA（含本地 marked.min.js）
+├── docs/                  # 项目文档
 ├── tests/                 # 单元测试
 ├── scripts/               # 工具脚本
 └── data/                  # 运行时数据（gitignored）
@@ -62,13 +63,13 @@ RAG-question/
 
 | 层 | 技术 |
 |----|------|
-| LLM | DeepSeek (deepseek-chat) |
+| LLM | DeepSeek (deepseek-chat, max_tokens=8192) |
 | Agent 框架 | LlamaIndex 0.12+ (ReAct) |
-| Embedding | sentence-transformers (384d) / 纯 NumPy 本地 (512d) |
+| Embedding | sentence-transformers (384d) / 纯 NumPy 本地 (256d) |
 | 向量数据库 | ChromaDB |
-| 后端 | FastAPI + SSE |
-| 前端 | 原生 HTML/CSS/JS (零构建依赖) |
-| 记忆 | SQLite + ChatMemoryBuffer |
+| 后端 | FastAPI + SSE 流式 |
+| 前端 | 原生 HTML/CSS/JS (零构建依赖) + marked.js 本地化 |
+| 记忆 | SQLite (持久化) + ChatMemoryBuffer (短期) |
 
 ## 评估
 

@@ -462,17 +462,20 @@ class RAGAgent:
                     full_response = text_so_far
                 else:
                     # ── 真流式: 继续消费剩余 chunk，逐步 yield ──
-                    # 先把已取到的 yield 出去（如果只有 first，那 second 是空的）
+                    # 用 accumulated 保证每次 yield 都是累积文本，server.py 依赖此特性计算增量
+                    accumulated = ""
                     if first:
-                        yield first
+                        accumulated = first
+                        yield accumulated
                     if second:
-                        full_response = second
-                        yield second
+                        accumulated += second
+                        yield accumulated
                     # 继续消费剩余的 gen
                     for delta in gen:
                         if delta:
-                            full_response += delta
-                            yield full_response
+                            accumulated += delta
+                            yield accumulated
+                    full_response = accumulated
 
                 break  # 成功，跳出重试循环
 

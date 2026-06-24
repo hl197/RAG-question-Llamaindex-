@@ -334,3 +334,31 @@ ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
 2. ✅ **在 `deepseek_llm.py` 中使用 `certifi.where()` 自动定位证书**，不再依赖 `SSL_CERT_FILE` 环境变量
 
 **关键文件**: `agent/deepseek_llm.py`（httpx.HTTPTransport 添加 `verify=certifi.where()`）
+
+---
+
+## 18. HuggingFace 模型下载超时 + ChromaDB 维度不匹配
+
+**错误**: 服务器启动后上传文件失败（500 Internal Server Error），日志显示多个错误：
+1. `HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded` — huggingface.co 被墙
+2. `SSL: UNEXPECTED_EOF_WHILE_READING` — 镜像站 hf-mirror.com SSL 连接被重置
+3. 上传文件返回 500 — ChromaDB 维度不匹配（LocalEmbedding 256d 旧 collection vs SemanticEmbedding 384d）
+
+**根因**:
+1. 国内网络 huggingface.co 被 GFW 阻断，且代理（127.0.0.1:9674）也无法建立 SSL 握手
+2. `hf-mirror.com` 的 CDN 域名（`cas-bridge.xethub.hf-mirror.org`、`us.aws.cdn.hf-mirror.org`）DNS 解析失败
+3. `knowledge/indexer.py` 的 `_init_embedding()` 硬编码了 `LocalEmbedding`，即使 `config.EMBED_TYPE="semantic"` 也会被覆盖，导致 ChromaDB 试图以 256d 创建 collection，后续 SemanticEmbedding（384d）插入时爆维度错误
+
+**解决过程**:
+1. ❌ 设置 `HF_ENDPOINT=https://hf-mirror.com` 并去掉 `HF_HUB_OFFLINE=1` — 仍 SSL 错误
+2. ❌ 设置代理 `HTTP_PROXY=http://127.0.0.1:9674` — huggingface.co SSL 握手被重置
+3. ❌ `git clone https://hf-mirror.com/...` — 仓库克隆成功但 LFS 大文件 CDN 域名不可达
+4. ✅ **从 hf-mirror.com 用 `curl -sL --max-time 600` 直接下载 model.safetensors（449MB）和 tokenizer.json（8.7MB）等 LFS 文件到 `~/.cache/sentence-transformers/`**
+5. ✅ **修改 `indexer.py._init_embedding()`**: 先检查 `Settings.embed_model` 是否已设置（由 `rag_agent.py` 决定），已设置则不覆盖
+6. ✅ **marked.js 本地化**: 浏览器跟踪防护拦截 CDN，改为 `static/marked.min.js`
+
+**关键文件**:
+- `knowledge/semantic_embedding.py` — 从 `~/.cache/sentence-transformers/` 本地路径加载模型
+- `knowledge/indexer.py` — `_init_embedding()` 不再硬编码 LocalEmbedding
+- `static/index.html` — marked.js 改为本地引用
+- `config.py` — 新增 `LLM_MAX_TOKENS=8192`、`LLM_CONTEXT_WINDOW`、`EMBED_TYPE` 等配置项
