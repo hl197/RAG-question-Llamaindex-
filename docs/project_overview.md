@@ -35,10 +35,12 @@
 ├─────────────────────────────────────────────────────────┤
 │              LLM 层 + 知识层 (knowledge/)                  │
 │  ┌──────────┐  ┌──────────────────────────────────────┐  │
-│  │DeepSeek  │  │ 检索增强管线 (Phase 3):               │  │
-│  │  LLM     │  │  查询分解 → 混合检索 → 重排序        │  │
-│  │(自定义   │  │  QueryDecomposer → HybridRetriever    │  │
-│  │ 封装)    │  │  → Reranker → ChromaDB                │  │
+│  │DeepSeek  │  │ 检索增强管线 (Phase 3.5):               │  │
+│  │  LLM     │  │  查询改写 → 查询分解 → 混合检索 →        │  │
+│  │(自定义   │  │  父文档映射 → 重排序 → ChromaDB          │  │
+│  │ 封装)    │  │  QueryRewriter → QueryDecomposer →       │  │
+│  │          │  │  HybridRetriever → ParentMapping →       │  │
+│  │          │  │  Reranker → ChromaDB                     │  │
 │  └──────────┘  └──────────────────────────────────────┘  │
 ├─────────────────────────────────────────────────────────┤
 │              持久化层 (agent/memory.py)                   │
@@ -70,10 +72,12 @@
 ```
 网页操作 → HTTP API → RAGAgent → LLM/ChromaDB → SSE 流式响应 → 前端渲染
 
-上传文件:  浏览器拖拽文件 → POST /api/files/upload
+上传文件:  浏览器拖拽文件 → POST /api/files/upload (XHR + 进度条)
           → agent.upload_file() → loader.load_document()
-          → SentenceSplitter 切分 → SemanticEmbedding 向量化
-          → ChromaDB insert_nodes() → file_registry 记录
+          → 父块切分 (2048 token) → 子块切分 (512 token)
+          → 子块向量化 (SemanticEmbedding 384d)
+          → ChromaDB insert_nodes() (子块存储, metadata含父块原文)
+          → file_registry 记录 → 进度条显示"处理完成"
 
 提问:      浏览器输入消息 → POST /api/chat/stream (SSE)
           → agent.chat_stream()
@@ -98,14 +102,18 @@ loader.load_document(file_path)
     │  依次尝试: PDF (pymupdf4llm) → DOCX → PPTX → TXT/MD/CSV
     │  返回: List[Document]
     ▼
-SentenceSplitter(chunk_size=512, overlap=128)
-    │  按 token 长度切分，保留上下文重叠
+ParentSplitter(chunk_size=2048, overlap=0)
+    │  先切父块（大粒度，用于 LLM 上下文）
     ▼
-SemanticEmbedding.encode(nodes) → 384维向量
+ChildSplitter(chunk_size=512, overlap=128)
+    │  每块父块再切子块（小粒度，用于向量检索）
+    ▼
+SemanticEmbedding.encode(sub_nodes) → 384维向量
     │  sentence-transformers 多语言模型
+    │  子块 metadata 中存储 parent_text（父块原文）
     ▼
 ChromaDB (knowledge_base collection)
-    │  cosine 距离索引
+    │  cosine 距离索引，只存子块
     ▼
 file_registry.json 记录文件名（去重）
 ```
@@ -123,20 +131,27 @@ ReAct Agent (Thought→Action→Observation→Answer)
     │
     ├─── 判断是否需要检索知识库
     │
-    ├── knowledge_base 工具调用:
+    ├── knowledge_base 工具调用 (完整 6 步管线):
     │     │
-    │     ├── QueryDecomposer.decompose(query)
+    │     ├── QueryRewriter.rewrite(query)
+    │     │    口语查询 → 关键词优化（LLM 改写）
+    │     │
+    │     ├── QueryDecomposer.decompose(rewritten)
     │     │    复杂问题 → [子问题1, 子问题2, ...]
     │     │
     │     ├── HybridRetriever.retrieve(sub_query)
-    │     │    向量检索 (top-16) + BM25 关键词检索 (top-16)
+    │     │    向量检索 (top-24) + BM25 关键词检索
     │     │    → RRF 融合 → top-8
+    │     │
+    │     ├── Parent Document Mapping
+    │     │    命中子块 → 映射回所属父块 → 去重
+    │     │    解决: 小粒度检索精度 + 大粒度上下文完整性
     │     │
     │     ├── Reranker.rerank(query, candidates)
     │     │    关键词评分 (0.3) + LLM 相关性评分 (0.7)
     │     │    → top-5 精排结果
     │     │
-    │     └── 返回检索片段 → Agent 观察
+    │     └── 返回片段 → Agent 观察
     │
     └── DeepSeek LLM 生成回答
           │  ReAct 格式解码 → 提取 Answer 部分
@@ -178,32 +193,41 @@ Agent 注册了两个核心工具：
 | `knowledge_base` | QueryEngineTool | 检索知识库文档片段 | 用户问具体知识性问题 |
 | `knowledge_summary` | FunctionTool | 返回知识库统计概览 | 用户问"有什么文件"/"知识库情况" |
 
-### 5.4 检索增强管线 (Phase 3)
+### 5.4 检索增强管线 (Phase 3.5)
 
-这是项目中最重要的优化模块，专门解决 RAG 的核心痛点：
+这是项目中最重要的优化模块，专门解决 RAG 的核心痛点。从 Phase 3 升级到 3.5，
+新增了查询改写和父文档检索两个阶段，形成完整的 6 步管线：
 
 ```
 用户 Query
     │
     ▼
 ┌─────────────────────────────────────────────────────┐
-│ Phase 3a: QueryDecomposer                            │
+│ Phase 3.5a: QueryRewriter                            │
+│  LLM 将口语化问题改写为检索友好的关键词查询          │
+│  "我想知道张三做了什么" → "张三 项目经历 工作职责"   │
+│  解决: 向量检索对口语/修饰词多的问题匹配效果差       │
+├─────────────────────────────────────────────────────┤
+│ Phase 3.5b: QueryDecomposer                          │
 │  LLM 判断是否为复杂查询（含多个问号/连接词）         │
 │  是 → 拆分为 2-3 个子查询，分别检索后合并结果        │
-│  否 → 原查询直接检索                                 │
 │  解决: "asyncio 和 GIL 有什么关系" 类跨主题问题       │
 ├─────────────────────────────────────────────────────┤
-│ Phase 3b: HybridRetriever                            │
-│  向量检索 (semantic) → top-16                        │
-│  BM25 关键词检索 → top-16                            │
+│ Phase 3.5c: HybridRetriever                          │
+│  向量检索 (semantic) → top-24                        │
+│  BM25 关键词检索 → top-24                            │
 │  RRF (倒数排名融合) 合并 → top-8                     │
 │  解决: 纯语义检索对精确术语/编号/代码匹配不足        │
 ├─────────────────────────────────────────────────────┤
-│ Phase 3c: Reranker                                   │
-│  关键词快速评分 (0.3权重)                            │
-│  LLM 语义相关性评分 (0.7权重)                        │
-│  加权融合 → top-5 最终结果                           │
-│  解决: 前两阶段召回量大，需要精排提升 top-K 准确率   │
+│ Phase 3.5d: Parent Document Mapping                  │
+│  命中子块 (512 token) → 映射回父块 (2048 token)      │
+│  去重后返回给 LLM                                    │
+│  解决: 小粒度检索精度 + 大粒度上下文完整性           │
+├─────────────────────────────────────────────────────┤
+│ Phase 3.5e: Reranker                                 │
+│  关键词评分 (0.3权重) + LLM 语义评分 (0.7权重)      │
+│  始终执行精排（不再因候选少而跳过）                  │
+│  解决: 前几阶段召回量大，需要精排提升 top-K 准确率   │
 └─────────────────────────────────────────────────────┘
     │
     ▼
@@ -238,9 +262,11 @@ Agent 注册了两个核心工具：
    - 从文档解析 → 向量化 → 检索增强 → LLM 生成 → 前端展示，全链路自实现
    - 无需 Gradio/Streamlit 等快速原型框架，采用 FastAPI + 原生 SPA，生产可用
 
-2. **检索增强管线深度优化**（Phase 3）
+2. **检索增强管线深度优化**（Phase 3 → 3.5）
+   - 查询改写（QueryRewriter）：LLM 口语转关键词，提升向量检索命中率
    - 查询分解器解决跨主题复杂问题
    - 混合检索融合语义 + 关键词，弥补纯向量对精确术语匹配的不足
+   - **父文档检索**：子块（512 token）检索精度 + 父块（2048 token）上下文完整性
    - LLM 两阶段重排序提升检索精准度
    - 对比纯向量检索，在 RAGAS 评测中显著提升 4 项指标
 
@@ -330,14 +356,15 @@ RAG-question/
 │   ├── deepseek_llm.py          # DeepSeek LLM 自定义封装
 │   ├── llm_adapter.py           # LLM 配置工厂
 │   └── memory.py                # SQLite 持久化记忆 + 摘要压缩
-├── knowledge/                   # 知识层（检索增强管线）
+├── knowledge/                   # 知识层（检索增强管线 Phase 3.5）
 │   ├── loader.py                # 多格式文档解析
-│   ├── indexer.py               # ChromaDB 索引管理
+│   ├── indexer.py               # ChromaDB 索引管理（父文档检索）
 │   ├── semantic_embedding.py    # sentence-transformers 语义 Embedding
 │   ├── local_embedding.py       # 纯 NumPy 本地 Embedding（零下载）
+│   ├── query_rewriter.py        # LLM 查询改写（口语→关键词）
+│   ├── query_decomposer.py      # LLM 查询分解（复杂→子查询）
 │   ├── hybrid_retriever.py      # 向量 + BM25 混合检索
-│   ├── reranker.py              # 关键词 + LLM 两阶段重排序
-│   └── query_decomposer.py      # LLM 查询分解
+│   └── reranker.py              # 关键词 + LLM 两阶段重排序
 ├── evaluation/                  # RAGAS 评估
 │   ├── evaluator.py             # 评估核心
 │   ├── test_data.py             # 测试文档 + QA 对

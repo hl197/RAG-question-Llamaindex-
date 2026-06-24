@@ -45,9 +45,11 @@ DeepSeekLLM      Knowledge Layer      ← LLM层 + 知识层
 (deepseek_llm.py)  ├── Loader (loader.py)
                    ├── Indexer (indexer.py, KnowledgeIndex 类)
                    ├── Embedding (semantic_embedding.py / local_embedding.py)
+                   ├── QueryRewriter (query_rewriter.py)
                    ├── QueryDecomposer (query_decomposer.py)
                    ├── HybridRetriever (hybrid_retriever.py)
-                   └── Reranker (reranker.py)
+                   ├── Reranker (reranker.py)
+                   └── ParentMapping (indexer.py · 子块→父块)
     ↓
 Persistent Memory (memory.py)     ← 持久化层 (SQLite)
     ↓
@@ -70,6 +72,7 @@ Evaluation (evaluation/)          ← 评估层 (RAGAS)
 | `knowledge/indexer.py` | KnowledgeIndex 类封装 ChromaDB 生命周期，向后兼容模块级函数 |
 | `knowledge/local_embedding.py` | 纯 NumPy Embedding（字符 n-gram + 随机投影，零下载） |
 | `knowledge/semantic_embedding.py` | sentence-transformers 语义 Embedding（384d，中英文，离缓存加载） |
+| `knowledge/query_rewriter.py` | LLM 查询改写：口语化问题→检索友好关键词 |
 | `knowledge/query_decomposer.py` | LLM 驱动的复杂查询拆分为子查询 |
 | `knowledge/hybrid_retriever.py` | 向量 + BM25 混合检索（RRF 融合） |
 | `knowledge/reranker.py` | 关键词 + LLM 两阶段重排序 |
@@ -102,6 +105,7 @@ RAG-question/
 │   ├── indexer.py               # ChromaDB 索引/检索（KnowledgeIndex 类）
 │   ├── local_embedding.py       # 纯 NumPy 本地 Embedding（256d，可配置）
 │   ├── semantic_embedding.py    # sentence-transformers 语义 Embedding（384d）
+│   ├── query_rewriter.py        # LLM 查询改写（口语→关键词）
 │   ├── query_decomposer.py      # LLM 查询分解
 │   ├── hybrid_retriever.py      # 向量 + BM25 混合检索
 │   └── reranker.py              # 关键词 + LLM 两阶段重排序
@@ -139,7 +143,7 @@ RAG-question/
 
 ### Data Flow
 
-**文件上传**: `POST /api/files/upload → server.upload_file() → RAGAgent.upload_file() → loader.load_document() → SentenceSplitter 切分 → SemanticEmbedding 向量化 → indexer.build_or_update_index() → ChromaDB insert_nodes()`
+**文件上传**: `POST /api/files/upload (XHR+进度条) → server.upload_file() → RAGAgent.upload_file() → loader.load_document() → 父块切分(2048) → 子块切分(512) → SemanticEmbedding 向量化 → ChromaDB insert_nodes()`
 
 **用户提问（JSON）**: `POST /api/chat → RAGAgent.chat() → 加载历史记忆 → ReActAgentWorker 推理循环 → (知识库检索/直接回答) → DeepSeek API → 保存回复`
 
@@ -167,7 +171,7 @@ RAG-question/
 
 - **FastAPI 替代 Gradio**: RESTful API + SSE 流式 + 原生 SPA 前端，零构建依赖，更好的定制性和生产可用性
 - **双 Embedding 策略**: `EMBED_TYPE="local"` 用字符 n-gram（零下载）或 `"semantic"` 用 sentence-transformers（384d，RAGAS answer_relevancy +18%）
-- **增强检索管线（Phase 3）**: 查询分解 → 混合检索（向量+BM25）→ 重排序（关键词+LLM），可通过 `config.py` 开关控制
+- **增强检索管线（Phase 3.5）**: 6 步管线：查询改写(LLM) → 查询分解 → 混合检索(向量+BM25) → 父文档映射(子块→父块) → 重排序(关键词+LLM)，可通过 `config.py` 开关控制
 - **自定义 LLM 封装**: 绕过 LlamaIndex OpenAI 模型名校验，支持任意 DeepSeek 模型名
 - **FixedReActAgentWorker**: 继承 ReActAgentWorker 重写 `_infer_stream_chunk_is_final`，修复 DeepSeek 流式输出误判为"最终答案"提前终止推理的问题
 - **两级记忆**: ChatMemoryBuffer（短期工作记忆）+ SQLite（长期持久化）+ 摘要压缩（4000 token 阈值）
@@ -203,9 +207,10 @@ RAG-question/
 - `LLM_MAX_TOKENS` — 单次回答最大 token 数，默认 `8192`
 - `LLM_CONTEXT_WINDOW` — 上下文窗口大小，默认 `65536`
 - `EMBED_TYPE` — `"semantic"`（语义模型 384d）或 `"local"`（纯 numpy 256d）
-- `CHUNK_SIZE / CHUNK_OVERLAP` — 文档分块参数（512 / 128）
+- `CHUNK_SIZE / CHUNK_OVERLAP` — 子块参数（512 / 128）
+- `PARENT_CHUNK_SIZE` — 父块大小（2048，父文档检索用）
 - `SIMILARITY_TOP_K / SIMILARITY_CUTOFF` — 检索参数（8 / 0.3）
-- `ENABLE_QUERY_DECOMPOSITION / HYBRID_RETRIEVAL / RERANKING` — Phase 3 检索增强开关
+- `ENABLE_QUERY_REWRITING / DECOMPOSITION / HYBRID_RETRIEVAL / RERANKING / PARENT_RETRIEVAL` — 检索增强管线开关
 
 ## Development Habits
 
